@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from trim.config import TrimConfig
+from smartaudiocrop.trim.config import TrimConfig
 
 
 class TrimSettingsDialog(QDialog):

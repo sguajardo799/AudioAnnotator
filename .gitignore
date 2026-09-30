@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# code editors
+.vscode
+
 # files
 audio_examples/
 *.csv
