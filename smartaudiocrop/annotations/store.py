@@ -1,5 +1,10 @@
 import sqlite3
+from math import isclose
 from pathlib import Path
+
+
+STATUS_NOT_VIEWED = "NOT_VIEWED"
+STATUS_VIEWED = "VIEWED"
 
 
 class AnnotationStore:
@@ -42,6 +47,11 @@ class AnnotationStore:
                 delta_start_ms REAL NOT NULL,
                 delta_end_ms REAL NOT NULL,
 
+                status TEXT NOT NULL
+                    CHECK (status IN ('NOT_VIEWED', 'VIEWED')),
+                is_modified INTEGER NOT NULL
+                    CHECK (is_modified IN (0, 1)),
+
                 updated_at TEXT NOT NULL
                     DEFAULT CURRENT_TIMESTAMP
             )
@@ -60,6 +70,7 @@ class AnnotationStore:
         auto_end: float,
         manual_start: float,
         manual_end: float,
+        status: str,
     ):
         """
         Inserta o actualiza la anotación de un archivo.
@@ -75,6 +86,21 @@ class AnnotationStore:
             manual_end - auto_end
         ) * 1000.0
 
+        is_modified = not (
+            isclose(
+                manual_start,
+                auto_start,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            and isclose(
+                manual_end,
+                auto_end,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        )
+
         self.connection.execute(
             """
             INSERT INTO annotations (
@@ -87,9 +113,11 @@ class AnnotationStore:
                 manual_end,
                 delta_start_ms,
                 delta_end_ms,
+                status,
+                is_modified,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 
             ON CONFLICT(filename)
             DO UPDATE SET
@@ -106,6 +134,9 @@ class AnnotationStore:
                 delta_start_ms = excluded.delta_start_ms,
                 delta_end_ms = excluded.delta_end_ms,
 
+                status = excluded.status,
+                is_modified = excluded.is_modified,
+
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -118,6 +149,8 @@ class AnnotationStore:
                 manual_end,
                 delta_start_ms,
                 delta_end_ms,
+                status,
+                int(is_modified),
             ),
         )
 
@@ -145,6 +178,8 @@ class AnnotationStore:
                 manual_end,
                 delta_start_ms,
                 delta_end_ms,
+                status,
+                is_modified,
                 updated_at
             FROM annotations
             WHERE filename = ?
@@ -167,12 +202,35 @@ class AnnotationStore:
             "manual_end",
             "delta_start_ms",
             "delta_end_ms",
+            "status",
+            "is_modified",
             "updated_at",
         ]
 
-        return dict(
+        annotation = dict(
             zip(columns, row)
         )
+        annotation["is_modified"] = bool(
+            annotation["is_modified"]
+        )
+        return annotation
+
+    def viewed_filenames(self) -> set[str]:
+        """Devuelve los archivos marcados como revisados."""
+
+        cursor = self.connection.execute(
+            """
+            SELECT filename
+            FROM annotations
+            WHERE status = ?
+            """,
+            (STATUS_VIEWED,),
+        )
+
+        return {
+            str(row[0])
+            for row in cursor.fetchall()
+        }
 
     def exists(
         self,

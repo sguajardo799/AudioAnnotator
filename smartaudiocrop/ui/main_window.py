@@ -11,8 +11,10 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QDialog,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -124,6 +126,29 @@ class MainWindow(QMainWindow):
             self.next_button
         )
 
+        tracking = QHBoxLayout()
+
+        self.file_counter_label = QLabel(
+            "File 0 of 0"
+        )
+        self.status_label = QLabel(
+            "Status: -"
+        )
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+
+        tracking.addWidget(
+            self.file_counter_label
+        )
+        tracking.addWidget(
+            self.status_label
+        )
+        tracking.addStretch()
+        tracking.addWidget(
+            self.progress_bar,
+            stretch=1,
+        )
+
         # -----------------------------------------------------
         # Señales
         # -----------------------------------------------------
@@ -152,6 +177,9 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(
             controls
+        )
+        layout.addLayout(
+            tracking
         )
 
         self.setCentralWidget(
@@ -401,6 +429,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             "Audio Annotator"
         )
+        self.update_project_tracking_ui()
 
     # =========================================================
     # Estado de controles
@@ -438,6 +467,41 @@ class MainWindow(QMainWindow):
 
         self.reset_trim_action.setEnabled(
             has_audio
+        )
+
+        self.update_project_tracking_ui()
+
+    def update_project_tracking_ui(self):
+        total = self.session.total_count
+        viewed = self.session.viewed_count
+
+        if not total:
+            self.file_counter_label.setText(
+                "File 0 of 0"
+            )
+            self.status_label.setText(
+                "Status: -"
+            )
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat(
+                "0/0 reviewed"
+            )
+            return
+
+        self.file_counter_label.setText(
+            (
+                f"File {self.session.current_index + 1} "
+                f"of {total}"
+            )
+        )
+        self.status_label.setText(
+            f"Status: {self.session.current_status}"
+        )
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(viewed)
+        self.progress_bar.setFormat(
+            f"{viewed}/{total} reviewed (%p%)"
         )
 
     # =========================================================
@@ -605,6 +669,7 @@ class MainWindow(QMainWindow):
             manual_start=manual_start,
             manual_end=manual_end,
         )
+        self.update_project_tracking_ui()
 
     def restore_annotation(self):
         """

@@ -2,7 +2,11 @@
 
 from pathlib import Path
 
-from smartaudiocrop.annotations.store import AnnotationStore
+from smartaudiocrop.annotations.store import (
+    STATUS_NOT_VIEWED,
+    STATUS_VIEWED,
+    AnnotationStore,
+)
 
 
 class ProjectSession:
@@ -35,6 +39,44 @@ class ProjectSession:
             and self.current_index < len(self.files) - 1
         )
 
+    @property
+    def total_count(self) -> int:
+        return len(self.files)
+
+    @property
+    def viewed_count(self) -> int:
+        if self.annotations is None:
+            return 0
+
+        project_filenames = {
+            path.name
+            for path in self.files
+        }
+        return len(
+            project_filenames
+            & self.annotations.viewed_filenames()
+        )
+
+    @property
+    def current_status(self) -> str:
+        annotation = self.get_current_annotation()
+
+        if annotation is None:
+            return STATUS_NOT_VIEWED
+
+        return str(annotation["status"])
+
+    @property
+    def progress_percent(self) -> int:
+        if not self.files:
+            return 0
+
+        return round(
+            self.viewed_count
+            / self.total_count
+            * 100
+        )
+
     def close_annotations(self):
         if self.annotations is not None:
             self.annotations.close()
@@ -62,6 +104,7 @@ class ProjectSession:
 
         self.annotations.save(
             filename=self.current_path.name,
+            status=STATUS_VIEWED,
             **values,
         )
 

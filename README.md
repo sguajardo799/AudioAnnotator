@@ -18,6 +18,7 @@ The application is an annotation tool. It does not modify, overwrite, or export 
 - Configure detector thresholds, timing, padding, and end hysteresis.
 - Save annotations automatically when navigating, changing projects, or closing the application.
 - Restore a previously saved manual selection when a recording is opened again.
+- Show the current file, review status, and overall project progress.
 
 ## Current Scope
 
@@ -93,6 +94,8 @@ The original WAV files are only read. They are not changed by the application.
 7. Move to the next or previous recording. The current annotation is saved automatically.
 8. Close the application when finished. The active annotation is saved before shutdown.
 
+A recording starts as `NOT_VIEWED` and becomes `VIEWED` when it is saved while navigating away, changing projects, or closing the application. The footer shows the current file position and the number of reviewed recordings in the project.
+
 ## Controls
 
 | Action | Button or shortcut |
@@ -142,9 +145,13 @@ The stored data includes:
 - Automatic start and end times
 - Manual start and end times
 - Manual-to-automatic start and end differences in milliseconds
+- Review status (`NOT_VIEWED` or `VIEWED`)
+- Whether the manual boundaries differ from the automatic proposal (`is_modified`)
 - Last update timestamp
 
 All boundary values other than the millisecond differences are stored in seconds. Annotation persistence is project-local: each selected project directory has its own database.
+
+`is_modified` is false when both manual boundaries match the automatic proposal within one microsecond. Resetting the manual selection to the automatic proposal therefore clears the modified state on the next save. Progress only counts `VIEWED` rows whose filenames still exist in the current project.
 
 ## Development Checks
 
@@ -154,7 +161,7 @@ Run the regression and architecture tests with:
 uv run python -m unittest discover -s tests -v
 ```
 
-The suite covers annotation persistence, audio loading, spectrogram output, project discovery and navigation, project switching, initial UI state, and dependency boundaries.
+The suite covers annotation and review-state persistence, audio loading, spectrogram output, project discovery and navigation, project progress, project switching, initial UI state, and dependency boundaries.
 
 ## Source Layout
 

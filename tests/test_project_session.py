@@ -39,6 +39,51 @@ class ProjectSessionTests(unittest.TestCase):
         self.assertFalse(session.change_index(1))
         self.assertEqual(session.current_index, 1)
 
+    def test_review_progress_persists_and_ignores_stale_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = [root / "a.wav", root / "b.wav"]
+            for path in files:
+                path.touch()
+
+            session = ProjectSession()
+            session.replace(root, files)
+
+            self.assertEqual(session.total_count, 2)
+            self.assertEqual(session.viewed_count, 0)
+            self.assertEqual(session.current_status, "NOT_VIEWED")
+            self.assertEqual(session.progress_percent, 0)
+
+            session.save_annotation(
+                duration=2.0,
+                sample_rate=48_000,
+                auto_start=0.2,
+                auto_end=1.8,
+                manual_start=0.2,
+                manual_end=1.8,
+            )
+            session.annotations.save(
+                filename="removed.wav",
+                duration=2.0,
+                sample_rate=48_000,
+                auto_start=0.2,
+                auto_end=1.8,
+                manual_start=0.2,
+                manual_end=1.8,
+                status="VIEWED",
+            )
+
+            self.assertEqual(session.current_status, "VIEWED")
+            self.assertEqual(session.viewed_count, 1)
+            self.assertEqual(session.progress_percent, 50)
+            session.close_annotations()
+
+            reopened = ProjectSession()
+            reopened.replace(root, files)
+            self.assertEqual(reopened.viewed_count, 1)
+            self.assertEqual(reopened.current_status, "VIEWED")
+            reopened.close_annotations()
+
 
 if __name__ == "__main__":
     unittest.main()
