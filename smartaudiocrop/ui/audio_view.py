@@ -2,10 +2,14 @@
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from smartaudiocrop.audio.analysis import spectrogram
+
+
+_AUTO_COLOR = "#E69F00"
+_MANUAL_COLOR = "#0072B2"
 
 
 class AudioView(QWidget):
@@ -15,21 +19,60 @@ class AudioView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        self.selection_legend = QWidget()
+        legend_layout = QHBoxLayout(self.selection_legend)
+        legend_layout.setContentsMargins(0, 0, 0, 0)
+
+        auto_swatch = QFrame()
+        auto_swatch.setFixedSize(28, 8)
+        auto_swatch.setStyleSheet(
+            f"border-top: 2px dashed {_AUTO_COLOR};"
+        )
+        legend_layout.addWidget(auto_swatch)
+        legend_layout.addWidget(QLabel("Automatic proposal"))
+
+        manual_swatch = QFrame()
+        manual_swatch.setFixedSize(28, 8)
+        manual_swatch.setStyleSheet(
+            f"border-top: 2px solid {_MANUAL_COLOR};"
+        )
+        legend_layout.addWidget(manual_swatch)
+        legend_layout.addWidget(QLabel("Manual selection"))
+        legend_layout.addStretch()
+
+        auto_pen = pg.mkPen(
+            _AUTO_COLOR,
+            width=2,
+            style=Qt.PenStyle.DashLine,
+        )
+        manual_pen = pg.mkPen(_MANUAL_COLOR, width=2)
+        manual_hover_pen = pg.mkPen(_MANUAL_COLOR, width=3)
+
         self.plot = pg.PlotWidget()
         self.waveform_curve = self.plot.plot()
         self.plot.setLabel("bottom", "Time", units="s")
 
-        self.region = pg.LinearRegionItem()
+        self.region = pg.LinearRegionItem(
+            pen=manual_pen,
+            hoverPen=manual_hover_pen,
+            brush=pg.mkBrush(0, 114, 178, 45),
+            hoverBrush=pg.mkBrush(0, 114, 178, 75),
+        )
+        self.region.setZValue(10)
         self.plot.addItem(self.region)
 
         self.auto_start_line = pg.InfiniteLine(
             angle=90,
             movable=False,
+            pen=auto_pen,
         )
         self.auto_end_line = pg.InfiniteLine(
             angle=90,
             movable=False,
+            pen=auto_pen,
         )
+        self.auto_start_line.setZValue(20)
+        self.auto_end_line.setZValue(20)
         self.plot.addItem(self.auto_start_line)
         self.plot.addItem(self.auto_end_line)
 
@@ -46,17 +89,22 @@ class AudioView(QWidget):
         self.spec_start_line = pg.InfiniteLine(
             angle=90,
             movable=False,
+            pen=manual_pen,
         )
         self.spec_end_line = pg.InfiniteLine(
             angle=90,
             movable=False,
+            pen=manual_pen,
         )
+        self.spec_start_line.setZValue(10)
+        self.spec_end_line.setZValue(10)
         self.spec_plot.addItem(self.spec_start_line)
         self.spec_plot.addItem(self.spec_end_line)
 
         cmap = pg.colormap.get("inferno")
         self.spec_image.setLookupTable(cmap.getLookupTable())
 
+        layout.addWidget(self.selection_legend)
         layout.addWidget(self.plot)
         layout.addWidget(self.spec_plot)
 
@@ -74,6 +122,7 @@ class AudioView(QWidget):
         self.auto_end_line.hide()
         self.spec_start_line.hide()
         self.spec_end_line.hide()
+        self.selection_legend.hide()
 
     def show_audio(
         self,
@@ -86,6 +135,7 @@ class AudioView(QWidget):
         self.auto_end_line.show()
         self.spec_start_line.show()
         self.spec_end_line.show()
+        self.selection_legend.show()
         self.plot.setTitle("")
 
         time = np.arange(len(audio)) / sample_rate

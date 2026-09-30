@@ -94,6 +94,8 @@ The original WAV files are only read. They are not changed by the application.
 7. Move to the next or previous recording. The current annotation is saved automatically.
 8. Close the application when finished. The active annotation is saved before shutdown.
 
+A dashed amber line marks each automatic detector boundary. Solid blue lines and a translucent blue region show the editable manual selection; the same solid blue boundaries are mirrored in the spectrogram.
+
 A recording starts as `NOT_VIEWED` and becomes `VIEWED` when it is saved while navigating away, changing projects, or closing the application. The footer shows the current file position and the number of reviewed recordings in the project.
 
 ## Controls
