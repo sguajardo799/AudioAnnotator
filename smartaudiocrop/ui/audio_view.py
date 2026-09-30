@@ -10,6 +10,7 @@ from smartaudiocrop.audio.analysis import spectrogram
 
 _AUTO_COLOR = "#E69F00"
 _MANUAL_COLOR = "#0072B2"
+_PLAYBACK_COLOR = "#CC79A7"
 
 
 class AudioView(QWidget):
@@ -76,6 +77,16 @@ class AudioView(QWidget):
         self.plot.addItem(self.auto_start_line)
         self.plot.addItem(self.auto_end_line)
 
+        playback_pen = pg.mkPen(_PLAYBACK_COLOR, width=2)
+        self.playback_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=playback_pen,
+        )
+        self.playback_line.setZValue(30)
+        self.plot.addItem(self.playback_line)
+        self.playback_line.hide()
+
         self.spec_plot = pg.PlotWidget()
         self.spec_image = pg.ImageItem()
         self.spec_plot.addItem(self.spec_image)
@@ -101,6 +112,15 @@ class AudioView(QWidget):
         self.spec_plot.addItem(self.spec_start_line)
         self.spec_plot.addItem(self.spec_end_line)
 
+        self.spec_playback_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=playback_pen,
+        )
+        self.spec_playback_line.setZValue(30)
+        self.spec_plot.addItem(self.spec_playback_line)
+        self.spec_playback_line.hide()
+
         cmap = pg.colormap.get("inferno")
         self.spec_image.setLookupTable(cmap.getLookupTable())
 
@@ -122,6 +142,7 @@ class AudioView(QWidget):
         self.auto_end_line.hide()
         self.spec_start_line.hide()
         self.spec_end_line.hide()
+        self.set_playback_cursor_visible(False)
         self.selection_legend.hide()
 
     def show_audio(
@@ -166,6 +187,7 @@ class AudioView(QWidget):
             sample_rate / 2,
             padding=0,
         )
+        self.set_playback_cursor_visible(False)
 
     def set_auto_bounds(self, start: float, end: float):
         self.auto_start_line.setPos(start)
@@ -183,3 +205,14 @@ class AudioView(QWidget):
         start, end = self.region.getRegion()
         self.spec_start_line.setPos(start)
         self.spec_end_line.setPos(end)
+
+    def set_playback_position(self, seconds: float):
+        self.playback_line.setPos(seconds)
+        self.spec_playback_line.setPos(seconds)
+
+    def set_playback_cursor_visible(self, visible: bool):
+        for line in (self.playback_line, self.spec_playback_line):
+            if visible:
+                line.show()
+            else:
+                line.hide()

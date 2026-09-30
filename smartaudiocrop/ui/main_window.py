@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import (
     QAction,
     QKeySequence,
@@ -9,6 +10,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QFileDialog,
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -21,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from smartaudiocrop.audio.loading import load_audio
-from smartaudiocrop.audio.player import AudioPlayer
+from smartaudiocrop.audio.player import AudioPlayer, PlaybackState
 from smartaudiocrop.project.session import ProjectSession
 from smartaudiocrop.trim.config import TrimConfig
 from smartaudiocrop.trim.detector import estimate_trim
@@ -30,7 +32,7 @@ from smartaudiocrop.ui.trim_settings_dialog import TrimSettingsDialog
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, player: AudioPlayer | None = None):
         super().__init__()
 
         self.setWindowTitle("Audio Annotator")
@@ -40,7 +42,7 @@ class MainWindow(QMainWindow):
         # Servicios
         # =====================================================
 
-        self.player = AudioPlayer()
+        self.player = player or AudioPlayer()
         self.session = ProjectSession()
 
         # Configuración actual del detector.
@@ -70,10 +72,16 @@ class MainWindow(QMainWindow):
         self.setup_menus()
         self.setup_shortcuts()
 
+        self.playback_timer = QTimer(self)
+        self.playback_timer.setInterval(33)
+        self.playback_timer.timeout.connect(
+            self.update_playback_ui
+        )
+
         # La aplicación parte sin proyecto.
         self.clear_project_view()
 
-        self.update_controls()
+        self.update_playback_ui()
 
     # =========================================================
     # UI
@@ -102,6 +110,18 @@ class MainWindow(QMainWindow):
             "Play"
         )
 
+        self.stop_button = QPushButton(
+            "Stop"
+        )
+
+        self.restart_button = QPushButton(
+            "Restart"
+        )
+
+        self.loop_checkbox = QCheckBox(
+            "Loop"
+        )
+
         self.reset_button = QPushButton(
             "Reset"
         )
@@ -119,11 +139,25 @@ class MainWindow(QMainWindow):
         )
 
         controls.addWidget(
+            self.stop_button
+        )
+
+        controls.addWidget(
+            self.restart_button
+        )
+
+        controls.addWidget(
             self.reset_button
         )
 
         controls.addWidget(
             self.next_button
+        )
+
+        controls.addStretch()
+
+        controls.addWidget(
+            self.loop_checkbox
         )
 
         tracking = QHBoxLayout()
@@ -158,7 +192,19 @@ class MainWindow(QMainWindow):
         )
 
         self.play_button.clicked.connect(
-            self.play_selection
+            self.toggle_playback
+        )
+
+        self.stop_button.clicked.connect(
+            self.stop_playback
+        )
+
+        self.restart_button.clicked.connect(
+            self.restart_playback
+        )
+
+        self.loop_checkbox.toggled.connect(
+            self.player.set_loop
         )
 
         self.reset_button.clicked.connect(
@@ -298,7 +344,7 @@ class MainWindow(QMainWindow):
         QShortcut(
             QKeySequence("Space"),
             self,
-            activated=self.play_selection,
+            activated=self.toggle_playback,
         )
 
         QShortcut(
@@ -457,6 +503,24 @@ class MainWindow(QMainWindow):
             has_audio
         )
 
+        snapshot = self.player.snapshot()
+        is_active = snapshot.state in {
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        }
+
+        self.stop_button.setEnabled(
+            has_audio and is_active
+        )
+
+        self.restart_button.setEnabled(
+            has_audio
+        )
+
+        self.loop_checkbox.setEnabled(
+            has_audio
+        )
+
         self.reset_button.setEnabled(
             has_audio
         )
@@ -516,6 +580,11 @@ class MainWindow(QMainWindow):
 
         self.audio, self.sr = load_audio(path)
 
+        self.player.set_source(
+            self.audio,
+            self.sr,
+        )
+
         self.duration = (
             len(self.audio)
             / self.sr
@@ -543,7 +612,7 @@ class MainWindow(QMainWindow):
             )
         )
 
-        self.update_controls()
+        self.update_playback_ui()
 
     # =========================================================
     # Detector automático
@@ -616,6 +685,18 @@ class MainWindow(QMainWindow):
     # Playback
     # =========================================================
 
+    def toggle_playback(self):
+        state = self.player.snapshot().state
+
+        if state is PlaybackState.PLAYING:
+            self.player.pause()
+        elif state is PlaybackState.PAUSED:
+            self.player.resume()
+        else:
+            self.play_selection()
+
+        self.update_playback_ui()
+
     def play_selection(self):
         if not self.session.files:
             return
@@ -630,14 +711,63 @@ class MainWindow(QMainWindow):
             end * self.sr
         )
 
-        segment = self.audio[
-            start_sample:end_sample
-        ]
+        if start_sample >= end_sample:
+            return
 
         self.player.play(
-            segment,
-            self.sr,
+            start_sample,
+            end_sample,
+            loop=self.loop_checkbox.isChecked(),
         )
+
+        self.playback_timer.start()
+
+    def stop_playback(self):
+        self.player.stop()
+        self.update_playback_ui()
+
+    def restart_playback(self):
+        if not self.session.files:
+            return
+
+        start, end = self.audio_view.manual_bounds()
+        start_sample = int(start * self.sr)
+        end_sample = int(end * self.sr)
+        if start_sample >= end_sample:
+            return
+
+        self.player.restart(
+            start_sample,
+            end_sample,
+            loop=self.loop_checkbox.isChecked(),
+        )
+        self.playback_timer.start()
+        self.update_playback_ui()
+
+    def update_playback_ui(self):
+        snapshot = self.player.snapshot()
+
+        if snapshot.state is PlaybackState.PLAYING:
+            self.play_button.setText("Pause")
+            if not self.playback_timer.isActive():
+                self.playback_timer.start()
+        elif snapshot.state is PlaybackState.PAUSED:
+            self.play_button.setText("Resume")
+            self.playback_timer.stop()
+        else:
+            self.play_button.setText("Play")
+            self.playback_timer.stop()
+
+        has_position = snapshot.selection_end_frames > snapshot.selection_start_frames
+        if has_position:
+            self.audio_view.set_playback_position(
+                snapshot.position_seconds
+            )
+            self.audio_view.set_playback_cursor_visible(True)
+        else:
+            self.audio_view.set_playback_cursor_visible(False)
+
+        self.update_controls()
 
     # =========================================================
     # Guardar anotación
@@ -708,7 +838,8 @@ class MainWindow(QMainWindow):
         if self.session.files:
             self.save_annotation()
 
-        self.player.stop()
+        self.playback_timer.stop()
+        self.player.close()
 
         self.session.close_annotations()
 

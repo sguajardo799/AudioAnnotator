@@ -13,6 +13,7 @@ from smartaudiocrop.ui.audio_view import AudioView
 
 AUTO_COLOR = "#e69f00"
 MANUAL_COLOR = "#0072b2"
+PLAYBACK_COLOR = "#cc79a7"
 
 
 class AudioViewTests(unittest.TestCase):
@@ -98,6 +99,31 @@ class AudioViewTests(unittest.TestCase):
             legend_text,
             {"Automatic proposal", "Manual selection"},
         )
+
+    def test_playback_cursor_updates_both_plots(self):
+        self.view.set_playback_position(0.42)
+        self.view.set_playback_cursor_visible(True)
+
+        self.assertEqual(self.view.playback_line.value(), 0.42)
+        self.assertEqual(self.view.spec_playback_line.value(), 0.42)
+        self.assertTrue(self.view.playback_line.isVisible())
+        self.assertTrue(self.view.spec_playback_line.isVisible())
+        self.assertEqual(
+            self.view.playback_line.pen.color().name(),
+            PLAYBACK_COLOR,
+        )
+        self.assertGreater(
+            self.view.playback_line.zValue(),
+            self.view.auto_start_line.zValue(),
+        )
+
+    def test_clear_hides_playback_cursor(self):
+        self.view.set_playback_cursor_visible(True)
+
+        self.view.clear()
+
+        self.assertFalse(self.view.playback_line.isVisible())
+        self.assertFalse(self.view.spec_playback_line.isVisible())
 
 
 if __name__ == "__main__":
