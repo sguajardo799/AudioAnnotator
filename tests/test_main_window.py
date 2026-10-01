@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from smartaudiocrop.audio.player import (
@@ -14,7 +16,12 @@ from smartaudiocrop.audio.player import (
     PlaybackSnapshot,
     PlaybackState,
 )
-from smartaudiocrop.ui.main_window import MainWindow
+from smartaudiocrop.ui.main_window import (
+    COARSE_TRIM_STEP_SECONDS,
+    FINE_TRIM_STEP_SECONDS,
+    MainWindow,
+)
+from smartaudiocrop.ui.trim_settings_dialog import TrimSettingsDialog
 
 
 class MainWindowTests(unittest.TestCase):
@@ -242,6 +249,168 @@ class MainWindowTests(unittest.TestCase):
 
             self.assertEqual(window.status_label.text(), "Status: VIEWED")
             self.assertEqual(window.progress_bar.value(), 2)
+            window.close()
+
+    def test_confirm_saves_once_and_advances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            self._write_silent_wav(root / "b.wav")
+            window = self._open_project(root)
+            original_save = window.save_annotation
+            window.save_annotation = Mock(wraps=original_save)
+
+            window.confirm_annotation()
+
+            window.save_annotation.assert_called_once_with()
+            self.assertEqual(window.session.current_index, 1)
+            self.assertEqual(window.session.viewed_count, 1)
+            window.close()
+
+    def test_confirm_on_last_file_saves_once_without_navigating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            original_save = window.save_annotation
+            window.save_annotation = Mock(wraps=original_save)
+            window.player.stop = Mock()
+
+            window.confirm_annotation()
+
+            window.save_annotation.assert_called_once_with()
+            window.player.stop.assert_not_called()
+            self.assertEqual(window.session.current_index, 0)
+            self.assertEqual(window.session.viewed_count, 1)
+            window.close()
+
+    def test_shortcuts_use_window_context_and_safe_auto_repeat(self):
+        window = MainWindow()
+
+        self.assertEqual(
+            set(window.shortcuts),
+            {
+                "Left",
+                "Right",
+                "Space",
+                "R",
+                "Return",
+                "Enter",
+                ",",
+                ".",
+                "Shift+,",
+                "Shift+.",
+                "Ctrl+,",
+                "Ctrl+.",
+                "Ctrl+Shift+,",
+                "Ctrl+Shift+.",
+            },
+        )
+        for shortcut in window.shortcuts.values():
+            self.assertEqual(
+                shortcut.context(),
+                Qt.ShortcutContext.WindowShortcut,
+            )
+
+        self.assertFalse(window.shortcuts["Return"].autoRepeat())
+        self.assertFalse(window.shortcuts["Enter"].autoRepeat())
+        self.assertTrue(window.shortcuts[","].autoRepeat())
+        self.assertTrue(window.shortcuts["Ctrl+Shift+."].autoRepeat())
+        window.close()
+
+    def test_modal_dialog_does_not_trigger_annotation_shortcuts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            window.show()
+            self.app.processEvents()
+            window.audio_view.set_manual_bounds(0.1, 0.2)
+            window.save_annotation = Mock()
+            window.player.play = Mock()
+            dialog = TrimSettingsDialog(window.trim_config, parent=window)
+            dialog.open()
+            self.app.processEvents()
+
+            QTest.keyClick(dialog, Qt.Key.Key_Space)
+            QTest.keyClick(dialog, Qt.Key.Key_Period)
+            QTest.keyClick(dialog, Qt.Key.Key_Return)
+            self.app.processEvents()
+
+            window.player.play.assert_not_called()
+            window.save_annotation.assert_not_called()
+            self.assertEqual(window.audio_view.manual_bounds(), (0.1, 0.2))
+            dialog.reject()
+            window.close()
+
+    def test_shortcut_adjustments_move_the_expected_edge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+
+            cases = (
+                (",", 0.1 - FINE_TRIM_STEP_SECONDS, 0.2),
+                (".", 0.1 + FINE_TRIM_STEP_SECONDS, 0.2),
+                ("Shift+,", 0.1 - COARSE_TRIM_STEP_SECONDS, 0.2),
+                ("Shift+.", 0.1 + COARSE_TRIM_STEP_SECONDS, 0.2),
+                ("Ctrl+,", 0.1, 0.2 - FINE_TRIM_STEP_SECONDS),
+                ("Ctrl+.", 0.1, 0.2 + FINE_TRIM_STEP_SECONDS),
+                ("Ctrl+Shift+,", 0.1, 0.2 - COARSE_TRIM_STEP_SECONDS),
+                ("Ctrl+Shift+.", 0.1, 0.2 + COARSE_TRIM_STEP_SECONDS),
+            )
+
+            for sequence, expected_start, expected_end in cases:
+                with self.subTest(sequence=sequence):
+                    window.audio_view.set_manual_bounds(0.1, 0.2)
+                    window.shortcuts[sequence].activated.emit()
+                    start, end = window.audio_view.manual_bounds()
+                    self.assertAlmostEqual(start, expected_start)
+                    self.assertAlmostEqual(end, expected_end)
+
+            window.close()
+
+    def test_adjustments_clamp_to_audio_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+
+            window.audio_view.set_manual_bounds(0.001, 0.25)
+            window.adjust_manual_bound("start", -FINE_TRIM_STEP_SECONDS)
+            window.adjust_manual_bound("end", COARSE_TRIM_STEP_SECONDS)
+
+            start, end = window.audio_view.manual_bounds()
+            self.assertEqual(start, 0.0)
+            self.assertEqual(end, window.duration)
+            window.close()
+
+    def test_adjustments_reject_equal_or_crossed_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+
+            window.audio_view.set_manual_bounds(0.1, 0.105)
+            window.adjust_manual_bound("start", FINE_TRIM_STEP_SECONDS)
+            self.assertEqual(window.audio_view.manual_bounds(), (0.1, 0.105))
+
+            window.adjust_manual_bound("end", -COARSE_TRIM_STEP_SECONDS)
+            self.assertEqual(window.audio_view.manual_bounds(), (0.1, 0.105))
+            window.close()
+
+    def test_adjustment_immediately_syncs_spectrogram_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            window.audio_view.set_manual_bounds(0.1, 0.2)
+
+            window.adjust_manual_bound("start", FINE_TRIM_STEP_SECONDS)
+
+            start, end = window.audio_view.manual_bounds()
+            self.assertEqual(window.audio_view.spec_start_line.value(), start)
+            self.assertEqual(window.audio_view.spec_end_line.value(), end)
             window.close()
 
     @staticmethod

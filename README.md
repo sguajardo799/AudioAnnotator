@@ -93,7 +93,7 @@ The original WAV files are only read. They are not changed by the application.
 5. Drag the editable waveform region to correct the selection when necessary.
 6. Press **Space** or select **Play** to listen to the selected interval.
 7. Use **Pause**, **Stop**, **Restart**, or **Loop** while validating its boundaries.
-8. Move to the next or previous recording. The current annotation is saved automatically.
+8. Press **Enter** to save the annotation and continue to the next recording, or use the navigation controls. The current annotation is saved automatically.
 9. Close the application when finished. The active annotation is saved before shutdown.
 
 A dashed amber line marks each automatic detector boundary. Solid blue lines and a translucent blue region show the editable manual selection; the same solid blue boundaries are mirrored in the spectrogram.
@@ -107,17 +107,23 @@ A recording starts as `NOT_VIEWED` and becomes `VIEWED` when it is saved while n
 | Open a project | **File > New Project...** or the platform Open shortcut |
 | Previous recording | **Prev** or **Left Arrow** |
 | Next recording | **Next** or **Right Arrow** |
+| Save annotation and continue | **Enter** or **Numpad Enter** |
 | Play or pause selected interval | **Play**/**Pause** or **Space** |
 | Resume paused playback | **Resume** or **Space** |
 | Stop playback | **Stop** |
 | Restart from current selection | **Restart** |
 | Repeat current playback selection | **Loop** |
 | Reset manual selection | **Reset**, **R**, or **Trim > Reset manual selection** |
+| Move start boundary by 5 ms | **,** or **.** |
+| Move start boundary by 25 ms | **Shift+,** or **Shift+.** |
+| Move end boundary by 5 ms | **Ctrl+,** or **Ctrl+.** |
+| Move end boundary by 25 ms | **Ctrl+Shift+,** or **Ctrl+Shift+.** |
 | Run the detector again | **Trim > Run detector** |
 | Configure the detector | **Trim > Settings...** |
 | Exit | **File > Exit** |
 
 Navigation buttons are disabled automatically at the first and last recordings.
+At the last recording, **Enter** saves the annotation without navigating away.
 
 Playback captures the current manual boundaries when **Play** or **Restart** is
 pressed. Moving the boundaries during playback or pause does not change the

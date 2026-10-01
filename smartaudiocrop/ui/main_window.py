@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QKeySequence,
@@ -29,6 +29,10 @@ from smartaudiocrop.trim.config import TrimConfig
 from smartaudiocrop.trim.detector import estimate_trim
 from smartaudiocrop.ui.audio_view import AudioView
 from smartaudiocrop.ui.trim_settings_dialog import TrimSettingsDialog
+
+
+FINE_TRIM_STEP_SECONDS = 0.005
+COARSE_TRIM_STEP_SECONDS = 0.025
 
 
 class MainWindow(QMainWindow):
@@ -329,29 +333,102 @@ class MainWindow(QMainWindow):
     # =========================================================
 
     def setup_shortcuts(self):
-        QShortcut(
-            QKeySequence("Left"),
-            self,
-            activated=self.prev_audio,
+        self.shortcuts: dict[str, QShortcut] = {}
+
+        self._add_shortcut(
+            "Left",
+            self.prev_audio,
         )
 
-        QShortcut(
-            QKeySequence("Right"),
-            self,
-            activated=self.next_audio,
+        self._add_shortcut(
+            "Right",
+            self.next_audio,
         )
 
-        QShortcut(
-            QKeySequence("Space"),
-            self,
-            activated=self.toggle_playback,
+        self._add_shortcut(
+            "Space",
+            self.toggle_playback,
         )
 
-        QShortcut(
-            QKeySequence("R"),
-            self,
-            activated=self.reset_manual_trim,
+        self._add_shortcut(
+            "R",
+            self.reset_manual_trim,
         )
+
+        self._add_shortcut(
+            "Return",
+            self.confirm_annotation,
+            auto_repeat=False,
+        )
+        self._add_shortcut(
+            "Enter",
+            self.confirm_annotation,
+            auto_repeat=False,
+        )
+
+        adjustments = {
+            ",": ("start", -FINE_TRIM_STEP_SECONDS),
+            ".": ("start", FINE_TRIM_STEP_SECONDS),
+            "Shift+,": ("start", -COARSE_TRIM_STEP_SECONDS),
+            "Shift+.": ("start", COARSE_TRIM_STEP_SECONDS),
+            "Ctrl+,": ("end", -FINE_TRIM_STEP_SECONDS),
+            "Ctrl+.": ("end", FINE_TRIM_STEP_SECONDS),
+            "Ctrl+Shift+,": ("end", -COARSE_TRIM_STEP_SECONDS),
+            "Ctrl+Shift+.": ("end", COARSE_TRIM_STEP_SECONDS),
+        }
+
+        for sequence, (edge, delta) in adjustments.items():
+            self._add_shortcut(
+                sequence,
+                lambda edge=edge, delta=delta: self.adjust_manual_bound(
+                    edge,
+                    delta,
+                ),
+            )
+
+    def _add_shortcut(
+        self,
+        sequence: str,
+        callback,
+        *,
+        auto_repeat: bool = True,
+    ):
+        shortcut = QShortcut(
+            QKeySequence(sequence),
+            self,
+        )
+        shortcut.setContext(
+            Qt.ShortcutContext.WindowShortcut
+        )
+        shortcut.setAutoRepeat(auto_repeat)
+        shortcut.activated.connect(callback)
+        self.shortcuts[sequence] = shortcut
+
+    def adjust_manual_bound(
+        self,
+        edge: str,
+        delta_seconds: float,
+    ):
+        if not self.session.files:
+            return
+
+        start, end = self.audio_view.manual_bounds()
+
+        if edge == "start":
+            new_start = max(0.0, start + delta_seconds)
+            if new_start >= end:
+                return
+            start = new_start
+        elif edge == "end":
+            new_end = min(self.duration, end + delta_seconds)
+            if new_end <= start:
+                return
+            end = new_end
+        else:
+            raise ValueError(f"Unknown trim edge: {edge}")
+
+        self.audio_view.set_manual_bounds(start, end)
+        self.on_region_changed()
 
     # =========================================================
     # NEW PROJECT
@@ -849,6 +926,15 @@ class MainWindow(QMainWindow):
     # Navegación
     # =========================================================
 
+    def confirm_annotation(self):
+        if not self.session.files:
+            return
+
+        self.save_annotation()
+
+        if self.session.has_next:
+            self._change_audio(+1)
+
     def change_audio(
         self,
         offset: int,
@@ -870,6 +956,13 @@ class MainWindow(QMainWindow):
 
         # Guardar antes de abandonar el WAV.
         self.save_annotation()
+
+        self._change_audio(offset)
+
+    def _change_audio(
+        self,
+        offset: int,
+    ):
 
         # Detener reproducción previa.
         self.player.stop()
