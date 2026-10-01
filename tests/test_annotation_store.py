@@ -73,6 +73,36 @@ class AnnotationStoreTests(unittest.TestCase):
             self.assertFalse(annotation["is_modified"])
             store.close()
 
+    def test_get_all_returns_every_row_in_filename_order_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AnnotationStore(Path(directory) / "annotations.db")
+
+            self.assertEqual(store.get_all(), [])
+
+            for filename, manual_start in (
+                ("b.wav", 0.3),
+                ("a.wav", 0.2),
+            ):
+                store.save(
+                    filename=filename,
+                    duration=2.0,
+                    sample_rate=48_000,
+                    auto_start=0.2,
+                    auto_end=1.8,
+                    manual_start=manual_start,
+                    manual_end=1.8,
+                    status=STATUS_VIEWED,
+                )
+
+            annotations = store.get_all()
+            self.assertEqual(
+                [row["filename"] for row in annotations],
+                ["a.wav", "b.wav"],
+            )
+            self.assertIsInstance(annotations[0]["is_modified"], bool)
+            self.assertEqual(store.get_all(), annotations)
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

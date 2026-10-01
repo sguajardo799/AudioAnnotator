@@ -20,6 +20,7 @@ The application is an annotation tool. It does not modify, overwrite, or export 
 - Save annotations automatically when navigating, changing projects, or closing the application.
 - Restore a previously saved manual selection when a recording is opened again.
 - Show the current file, review status, and overall project progress.
+- Export saved project annotations to CSV for external analysis.
 
 ## Current Scope
 
@@ -30,7 +31,7 @@ SmartAudioCrop currently:
 - Processes one recording at a time in the desktop interface.
 - Uses the system's default audio output device.
 - Stores detector settings only for the current application session.
-- Stores annotations in SQLite but does not provide CSV export.
+- Stores annotations in SQLite and exports them to CSV on demand.
 - Records trim boundaries but does not create cropped audio files.
 
 ## Requirements
@@ -94,7 +95,8 @@ The original WAV files are only read. They are not changed by the application.
 6. Press **Space** or select **Play** to listen to the selected interval.
 7. Use **Pause**, **Stop**, **Restart**, or **Loop** while validating its boundaries.
 8. Press **Enter** to save the annotation and continue to the next recording, or use the navigation controls. The current annotation is saved automatically.
-9. Close the application when finished. The active annotation is saved before shutdown.
+9. Select **File > Export Annotations...** to export the annotations already saved in SQLite.
+10. Close the application when finished. The active annotation is saved before shutdown.
 
 A dashed amber line marks each automatic detector boundary. Solid blue lines and a translucent blue region show the editable manual selection; the same solid blue boundaries are mirrored in the spectrogram.
 
@@ -105,6 +107,7 @@ A recording starts as `NOT_VIEWED` and becomes `VIEWED` when it is saved while n
 | Action | Button or shortcut |
 | --- | --- |
 | Open a project | **File > New Project...** or the platform Open shortcut |
+| Export saved annotations | **File > Export Annotations...** |
 | Previous recording | **Prev** or **Left Arrow** |
 | Next recording | **Next** or **Right Arrow** |
 | Save annotation and continue | **Enter** or **Numpad Enter** |
@@ -171,6 +174,26 @@ The stored data includes:
 All boundary values other than the millisecond differences are stored in seconds. Annotation persistence is project-local: each selected project directory has its own database.
 
 `is_modified` is false when both manual boundaries match the automatic proposal within one microsecond. Resetting the manual selection to the automatic proposal therefore clears the modified state on the next save. Progress only counts `VIEWED` rows whose filenames still exist in the current project.
+
+## Annotation Export
+
+Use **File > Export Annotations...** after opening a project to create a CSV containing every annotation currently stored in the project's `annotations.db`. Unsaved changes to the visible selection are not persisted automatically by exporting and therefore are not included.
+
+Rows are ordered by filename and contain:
+
+- `filename`
+- `duration`
+- `sample_rate`
+- `auto_start`
+- `auto_end`
+- `manual_start`
+- `manual_end`
+- `delta_start_ms`
+- `delta_end_ms`
+- `reviewed` (`true` when the stored status is `VIEWED`)
+- `updated_at`
+
+The four boundary columns and `duration` use seconds. Delta columns use milliseconds. Exporting reads SQLite without modifying annotations or WAV files. If the database contains no annotations, the application reports it without creating an empty export.
 
 ## Development Checks
 

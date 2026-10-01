@@ -6,6 +6,21 @@ from pathlib import Path
 STATUS_NOT_VIEWED = "NOT_VIEWED"
 STATUS_VIEWED = "VIEWED"
 
+ANNOTATION_COLUMNS = (
+    "filename",
+    "duration",
+    "sample_rate",
+    "auto_start",
+    "auto_end",
+    "manual_start",
+    "manual_end",
+    "delta_start_ms",
+    "delta_end_ms",
+    "status",
+    "is_modified",
+    "updated_at",
+)
+
 
 class AnnotationStore:
     """
@@ -192,23 +207,40 @@ class AnnotationStore:
         if row is None:
             return None
 
-        columns = [
-            "filename",
-            "duration",
-            "sample_rate",
-            "auto_start",
-            "auto_end",
-            "manual_start",
-            "manual_end",
-            "delta_start_ms",
-            "delta_end_ms",
-            "status",
-            "is_modified",
-            "updated_at",
+        return self._row_to_annotation(row)
+
+    def get_all(self) -> list[dict]:
+        """Devuelve todas las anotaciones ordenadas por filename."""
+
+        cursor = self.connection.execute(
+            """
+            SELECT
+                filename,
+                duration,
+                sample_rate,
+                auto_start,
+                auto_end,
+                manual_start,
+                manual_end,
+                delta_start_ms,
+                delta_end_ms,
+                status,
+                is_modified,
+                updated_at
+            FROM annotations
+            ORDER BY filename
+            """
+        )
+
+        return [
+            self._row_to_annotation(row)
+            for row in cursor.fetchall()
         ]
 
+    @staticmethod
+    def _row_to_annotation(row) -> dict:
         annotation = dict(
-            zip(columns, row)
+            zip(ANNOTATION_COLUMNS, row)
         )
         annotation["is_modified"] = bool(
             annotation["is_modified"]

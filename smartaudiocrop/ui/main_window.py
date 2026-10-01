@@ -22,6 +22,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from smartaudiocrop.annotations.exporter import (
+    AnnotationExportError,
+    AnnotationExporter,
+)
 from smartaudiocrop.audio.loading import load_audio
 from smartaudiocrop.audio.player import AudioPlayer, PlaybackState
 from smartaudiocrop.project.session import ProjectSession
@@ -266,6 +270,19 @@ class MainWindow(QMainWindow):
             self.new_project_action
         )
 
+        self.export_annotations_action = QAction(
+            "Export Annotations...",
+            self,
+        )
+
+        self.export_annotations_action.triggered.connect(
+            self.export_annotations
+        )
+
+        file_menu.addAction(
+            self.export_annotations_action
+        )
+
         file_menu.addSeparator()
 
         exit_action = QAction(
@@ -431,6 +448,69 @@ class MainWindow(QMainWindow):
         self.on_region_changed()
 
     # =========================================================
+    # EXPORT ANNOTATIONS
+    # =========================================================
+
+    def export_annotations(self):
+        store = self.session.annotations
+
+        if store is None or self.session.project_dir is None:
+            return
+
+        annotations = store.get_all()
+
+        if not annotations:
+            QMessageBox.warning(
+                self,
+                "No Annotations",
+                "There are no saved annotations to export.",
+            )
+            return
+
+        default_path = (
+            self.session.project_dir
+            / "annotations_export.csv"
+        )
+        destination, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Annotations",
+            str(default_path),
+            "CSV Files (*.csv)",
+        )
+
+        if not destination:
+            return
+
+        destination_path = Path(destination).resolve()
+        protected_paths = {
+            (self.session.project_dir / "annotations.db").resolve(),
+            *(path.resolve() for path in self.session.files),
+        }
+
+        if destination_path in protected_paths:
+            QMessageBox.warning(
+                self,
+                "Invalid Export Destination",
+                (
+                    "Annotations cannot be exported over the project "
+                    "database or a WAV file."
+                ),
+            )
+            return
+
+        try:
+            AnnotationExporter.export_csv(
+                annotations,
+                destination,
+            )
+        except AnnotationExportError as exc:
+            QMessageBox.warning(
+                self,
+                "Export Failed",
+                str(exc),
+            )
+
+    # =========================================================
     # NEW PROJECT
     # =========================================================
 
@@ -441,7 +521,7 @@ class MainWindow(QMainWindow):
         Actualmente un proyecto consiste simplemente en:
             - una carpeta
             - sus archivos WAV
-            - annotations.csv
+            - annotations.db
 
         No se realiza búsqueda recursiva.
         """
@@ -607,6 +687,10 @@ class MainWindow(QMainWindow):
         )
 
         self.reset_trim_action.setEnabled(
+            has_audio
+        )
+
+        self.export_annotations_action.setEnabled(
             has_audio
         )
 

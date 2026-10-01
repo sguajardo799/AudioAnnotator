@@ -44,6 +44,21 @@ class ArchitectureTests(unittest.TestCase):
                     "sounddevice",
                     "soundfile",
                     "sqlite3",
+                    "csv",
+                }
+            )
+        )
+
+    def test_annotation_exporter_has_no_ui_dependencies(self):
+        imports = imported_roots(
+            ROOT / "annotations" / "exporter.py"
+        )
+
+        self.assertTrue(
+            imports.isdisjoint(
+                {
+                    "PySide6",
+                    "pyqtgraph",
                 }
             )
         )

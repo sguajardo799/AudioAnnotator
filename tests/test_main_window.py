@@ -3,7 +3,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from smartaudiocrop.annotations.exporter import AnnotationExportError
 from smartaudiocrop.audio.player import (
     AudioPlayer,
     PlaybackSnapshot,
@@ -42,12 +43,192 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(window.reset_button.isEnabled())
         self.assertFalse(window.run_trim_action.isEnabled())
         self.assertFalse(window.reset_trim_action.isEnabled())
+        self.assertFalse(window.export_annotations_action.isEnabled())
         self.assertEqual(window.file_counter_label.text(), "File 0 of 0")
         self.assertEqual(window.status_label.text(), "Status: -")
         self.assertEqual(window.progress_bar.value(), 0)
         self.assertEqual(window.progress_bar.format(), "0/0 reviewed")
 
         window.close()
+
+    def test_export_action_is_enabled_for_an_open_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+
+            window = self._open_project(root)
+
+            self.assertEqual(
+                window.export_annotations_action.text(),
+                "Export Annotations...",
+            )
+            self.assertTrue(window.export_annotations_action.isEnabled())
+            window.close()
+
+    def test_export_with_no_saved_annotations_warns_before_opening_dialog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+
+            with (
+                patch(
+                    "smartaudiocrop.ui.main_window.QMessageBox.warning"
+                ) as warning,
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "QFileDialog.getSaveFileName"
+                ) as save_dialog,
+            ):
+                window.export_annotations()
+
+            warning.assert_called_once_with(
+                window,
+                "No Annotations",
+                "There are no saved annotations to export.",
+            )
+            save_dialog.assert_not_called()
+            window.close()
+
+    def test_export_cancel_does_not_write_or_save_current_annotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            window.save_annotation()
+            window.save_annotation = Mock()
+
+            with (
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "QFileDialog.getSaveFileName",
+                    return_value=("", ""),
+                ),
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "AnnotationExporter.export_csv"
+                ) as export_csv,
+            ):
+                window.export_annotations()
+
+            export_csv.assert_not_called()
+            window.save_annotation.assert_not_called()
+            window.close()
+
+    def test_export_delegates_persisted_rows_and_selected_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "dataset.csv"
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            window.save_annotation()
+            persisted = window.session.annotations.get_all()
+            window.save_annotation = Mock()
+
+            with (
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "CSV Files (*.csv)"),
+                ),
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "AnnotationExporter.export_csv"
+                ) as export_csv,
+            ):
+                window.export_annotations()
+
+            export_csv.assert_called_once_with(
+                persisted,
+                str(destination),
+            )
+            window.save_annotation.assert_not_called()
+            window.close()
+
+    def test_export_write_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "dataset.csv"
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            window.save_annotation()
+
+            error = AnnotationExportError("Could not write export")
+            with (
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "QFileDialog.getSaveFileName",
+                    return_value=(str(destination), "CSV Files (*.csv)"),
+                ),
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "AnnotationExporter.export_csv",
+                    side_effect=error,
+                ),
+                patch(
+                    "smartaudiocrop.ui.main_window.QMessageBox.warning"
+                ) as warning,
+            ):
+                window.export_annotations()
+
+            warning.assert_called_once_with(
+                window,
+                "Export Failed",
+                "Could not write export",
+            )
+            window.close()
+
+    def test_export_cannot_overwrite_project_database_or_wav(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav_path = root / "a.wav"
+            self._write_silent_wav(wav_path)
+            window = self._open_project(root)
+            window.save_annotation()
+            database = root / "annotations.db"
+
+            with (
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "QFileDialog.getSaveFileName",
+                    side_effect=[
+                        (str(database), "CSV Files (*.csv)"),
+                        (str(wav_path), "CSV Files (*.csv)"),
+                    ],
+                ),
+                patch(
+                    "smartaudiocrop.ui.main_window."
+                    "AnnotationExporter.export_csv"
+                ) as export_csv,
+                patch(
+                    "smartaudiocrop.ui.main_window.QMessageBox.warning"
+                ) as warning,
+            ):
+                window.export_annotations()
+                window.export_annotations()
+
+            export_csv.assert_not_called()
+            warning.assert_has_calls(
+                [
+                    call(
+                        window,
+                        "Invalid Export Destination",
+                        (
+                            "Annotations cannot be exported over the project "
+                            "database or a WAV file."
+                        ),
+                    ),
+                    call(
+                        window,
+                        "Invalid Export Destination",
+                        (
+                            "Annotations cannot be exported over the project "
+                            "database or a WAV file."
+                        ),
+                    ),
+                ]
+            )
+            window.close()
 
     def test_project_switch_preserves_existing_save_and_stop_order(self):
         with tempfile.TemporaryDirectory() as directory:
