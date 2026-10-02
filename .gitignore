@@ -10,7 +10,7 @@ wheels/
 .venv
 
 # code editors
-.vscode
+.vscode/*
 
 # files
 audio_examples/
