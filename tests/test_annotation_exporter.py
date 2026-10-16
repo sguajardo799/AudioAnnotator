@@ -119,6 +119,34 @@ class AnnotationExporterTests(unittest.TestCase):
             self.assertEqual(row["reviewed"], "true")
             self.assertEqual(database_after, database_before)
 
+    def test_provenance_columns_are_appended_after_legacy_columns(self):
+        legacy_prefix = (
+            "filename",
+            "duration",
+            "sample_rate",
+            "auto_start",
+            "auto_end",
+            "manual_start",
+            "manual_end",
+            "delta_start_ms",
+            "delta_end_ms",
+            "reviewed",
+            "updated_at",
+        )
+
+        self.assertEqual(CSV_COLUMNS[: len(legacy_prefix)], legacy_prefix)
+        self.assertEqual(
+            CSV_COLUMNS[len(legacy_prefix) :],
+            (
+                "proposal_source",
+                "prediction_id",
+                "model_id",
+                "model_version",
+                "model_sha256",
+                "threshold",
+            ),
+        )
+
     @staticmethod
     def _annotation(
         *,

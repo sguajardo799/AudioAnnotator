@@ -21,6 +21,12 @@ CSV_COLUMNS = (
     "delta_end_ms",
     "reviewed",
     "updated_at",
+    "proposal_source",
+    "prediction_id",
+    "model_id",
+    "model_version",
+    "model_sha256",
+    "threshold",
 )
 
 
@@ -75,6 +81,12 @@ class AnnotationExporter:
                                 else "false"
                             ),
                             "updated_at": annotation["updated_at"],
+                            "proposal_source": annotation.get("proposal_source"),
+                            "prediction_id": annotation.get("prediction_id"),
+                            "model_id": annotation.get("model_id"),
+                            "model_version": annotation.get("model_version"),
+                            "model_sha256": annotation.get("model_sha256"),
+                            "threshold": annotation.get("threshold"),
                         }
                     )
 

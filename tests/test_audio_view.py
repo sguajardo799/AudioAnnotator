@@ -55,6 +55,16 @@ class AudioViewTests(unittest.TestCase):
             self.view.spec_start_line.pen.color().name(),
             MANUAL_COLOR,
         )
+
+    def test_proposal_markers_are_mirrored_on_spectrogram(self):
+        self.view.set_proposal_bounds(0.25, 0.75)
+
+        self.assertEqual(self.view.spec_auto_start_line.value(), 0.25)
+        self.assertEqual(self.view.spec_auto_end_line.value(), 0.75)
+        self.assertEqual(
+            self.view.spec_auto_start_line.pen.style(),
+            Qt.PenStyle.DashLine,
+        )
         self.assertEqual(
             self.view.spec_start_line.pen.style(),
             Qt.PenStyle.SolidLine,

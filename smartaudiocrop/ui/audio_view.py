@@ -30,7 +30,8 @@ class AudioView(QWidget):
             f"border-top: 2px dashed {_AUTO_COLOR};"
         )
         legend_layout.addWidget(auto_swatch)
-        legend_layout.addWidget(QLabel("Automatic proposal"))
+        self.proposal_label = QLabel("Automatic proposal")
+        legend_layout.addWidget(self.proposal_label)
 
         manual_swatch = QFrame()
         manual_swatch.setFixedSize(28, 8)
@@ -112,6 +113,21 @@ class AudioView(QWidget):
         self.spec_plot.addItem(self.spec_start_line)
         self.spec_plot.addItem(self.spec_end_line)
 
+        self.spec_auto_start_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=auto_pen,
+        )
+        self.spec_auto_end_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=auto_pen,
+        )
+        self.spec_auto_start_line.setZValue(20)
+        self.spec_auto_end_line.setZValue(20)
+        self.spec_plot.addItem(self.spec_auto_start_line)
+        self.spec_plot.addItem(self.spec_auto_end_line)
+
         self.spec_playback_line = pg.InfiniteLine(
             angle=90,
             movable=False,
@@ -140,6 +156,8 @@ class AudioView(QWidget):
         self.region.hide()
         self.auto_start_line.hide()
         self.auto_end_line.hide()
+        self.spec_auto_start_line.hide()
+        self.spec_auto_end_line.hide()
         self.spec_start_line.hide()
         self.spec_end_line.hide()
         self.set_playback_cursor_visible(False)
@@ -154,18 +172,21 @@ class AudioView(QWidget):
         self.region.show()
         self.auto_start_line.show()
         self.auto_end_line.show()
+        self.spec_auto_start_line.show()
+        self.spec_auto_end_line.show()
         self.spec_start_line.show()
         self.spec_end_line.show()
         self.selection_legend.show()
         self.plot.setTitle("")
 
-        time = np.arange(len(audio)) / sample_rate
-        self.waveform_curve.setData(time, audio)
+        display_audio = audio.mean(axis=1) if audio.ndim == 2 else audio
+        time = np.arange(len(display_audio)) / sample_rate
+        self.waveform_curve.setData(time, display_audio)
         self.region.setBounds([0, duration])
         self.plot.setXRange(0, duration, padding=0)
 
         spec, _times, _frequencies = spectrogram(
-            audio,
+            display_audio,
             sample_rate,
         )
         self.spec_image.setImage(
@@ -189,10 +210,34 @@ class AudioView(QWidget):
         )
         self.set_playback_cursor_visible(False)
 
-    def set_auto_bounds(self, start: float, end: float):
+    def set_proposal_bounds(self, start: float, end: float):
+        for line in (
+            self.auto_start_line, self.auto_end_line,
+            self.spec_auto_start_line, self.spec_auto_end_line,
+        ):
+            line.show()
         self.auto_start_line.setPos(start)
         self.auto_end_line.setPos(end)
-        self.region.setRegion([start, end])
+        self.spec_auto_start_line.setPos(start)
+        self.spec_auto_end_line.setPos(end)
+
+    def set_auto_bounds(self, start: float, end: float):
+        """Compatibility alias; automatic bounds never modify manual bounds."""
+
+        self.set_proposal_bounds(start, end)
+
+    def initialize_manual_from_proposal(self, start: float, end: float):
+        self.set_proposal_bounds(start, end)
+        self.set_manual_bounds(start, end)
+
+    def clear_proposal(self):
+        self.auto_start_line.hide()
+        self.auto_end_line.hide()
+        self.spec_auto_start_line.hide()
+        self.spec_auto_end_line.hide()
+
+    def set_proposal_text(self, text: str):
+        self.proposal_label.setText(text)
 
     def set_manual_bounds(self, start: float, end: float):
         self.region.setRegion([start, end])

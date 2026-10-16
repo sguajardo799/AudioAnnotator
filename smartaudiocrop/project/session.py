@@ -15,6 +15,7 @@ class ProjectSession:
         self.files: list[Path] = []
         self.current_index = 0
         self.annotations: AnnotationStore | None = None
+        self.project_generation = 0
 
     @staticmethod
     def discover_audio_files(project_dir: Path) -> list[Path]:
@@ -80,14 +81,16 @@ class ProjectSession:
     def close_annotations(self):
         if self.annotations is not None:
             self.annotations.close()
+            self.annotations = None
 
     def replace(self, project_dir: Path, files: list[Path]):
+        annotations = AnnotationStore(project_dir / "annotations.db")
+        self.close_annotations()
         self.project_dir = project_dir
         self.files = files
         self.current_index = 0
-        self.annotations = AnnotationStore(
-            project_dir / "annotations.db"
-        )
+        self.annotations = annotations
+        self.project_generation += 1
 
     def change_index(self, offset: int) -> bool:
         new_index = self.current_index + offset
@@ -99,12 +102,29 @@ class ProjectSession:
         return True
 
     def save_annotation(self, **values):
+        """Compatibility wrapper for an explicit reviewed save."""
         if self.annotations is None or not self.files:
             return
 
         self.annotations.save(
             filename=self.current_path.name,
             status=STATUS_VIEWED,
+            **values,
+        )
+
+    def autosave_current_annotation(self, **values):
+        if self.annotations is None or not self.files:
+            return
+        self.annotations.save_manual_draft(
+            filename=self.current_path.name,
+            **values,
+        )
+
+    def confirm_current_annotation(self, **values):
+        if self.annotations is None or not self.files:
+            return
+        self.annotations.confirm_annotation(
+            filename=self.current_path.name,
             **values,
         )
 

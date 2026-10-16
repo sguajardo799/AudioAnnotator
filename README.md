@@ -11,13 +11,16 @@ The application is an annotation tool. It does not modify, overwrite, or export 
 - Navigate recordings in sorted filename order.
 - Display synchronized waveform and spectrogram views.
 - Estimate start and end boundaries with an adaptive RMS detector.
+- Load a validated local CRNN ONNX package and run CPU pre-annotation without
+  blocking playback or navigation.
 - Display automatic boundaries separately from the editable selection.
 - Adjust the manual selection directly in the waveform.
 - Play, pause, resume, stop, restart, or loop the selected audio interval.
 - Follow playback with a synchronized cursor in the waveform and spectrogram.
 - Reset the manual selection to the current automatic proposal.
 - Configure detector thresholds, timing, padding, and end hysteresis.
-- Save annotations automatically when navigating, changing projects, or closing the application.
+- Save edited drafts automatically without marking them as reviewed.
+- Mark an annotation as reviewed only through explicit confirmation.
 - Restore a previously saved manual selection when a recording is opened again.
 - Show the current file, review status, and overall project progress.
 - Export saved project annotations to CSV for external analysis.
@@ -40,7 +43,9 @@ SmartAudioCrop currently:
 - A working audio output device for playback
 - [uv](https://docs.astral.sh/uv/) for the recommended environment setup
 
-The Python dependencies include PySide6, pyqtgraph, NumPy, SciPy, SoundFile, and SoundDevice. Depending on the operating system, SoundDevice may also require a system PortAudio installation.
+The Python dependencies include PySide6, pyqtgraph, NumPy, SciPy, SoundFile,
+SoundDevice, and ONNX Runtime CPU. Depending on the operating system,
+SoundDevice may also require a system PortAudio installation.
 
 ## Installation
 
@@ -94,13 +99,17 @@ The original WAV files are only read. They are not changed by the application.
 5. Drag the editable waveform region to correct the selection when necessary.
 6. Press **Space** or select **Play** to listen to the selected interval.
 7. Use **Pause**, **Stop**, **Restart**, or **Loop** while validating its boundaries.
-8. Press **Enter** to save the annotation and continue to the next recording, or use the navigation controls. The current annotation is saved automatically.
+8. Press **Enter** to confirm the annotation and continue to the next recording.
+   Navigation and close preserve edited drafts as `NOT_VIEWED`.
 9. Select **File > Export Annotations...** to export the annotations already saved in SQLite.
 10. Close the application when finished. The active annotation is saved before shutdown.
 
 A dashed amber line marks each automatic detector boundary. Solid blue lines and a translucent blue region show the editable manual selection; the same solid blue boundaries are mirrored in the spectrogram.
 
-A recording starts as `NOT_VIEWED` and becomes `VIEWED` when it is saved while navigating away, changing projects, or closing the application. The footer shows the current file position and the number of reviewed recordings in the project.
+A recording starts as `NOT_VIEWED` and becomes `VIEWED` only after explicit
+confirmation with Enter. Inference, navigation, project changes, and closing do
+not count as review. The footer shows the current file position and the number
+of reviewed recordings in the project.
 
 ## Controls
 
@@ -122,6 +131,9 @@ A recording starts as `NOT_VIEWED` and becomes `VIEWED` when it is saved while n
 | Move end boundary by 5 ms | **Ctrl+,** or **Ctrl+.** |
 | Move end boundary by 25 ms | **Ctrl+Shift+,** or **Ctrl+Shift+.** |
 | Run the detector again | **Trim > Run detector** |
+| Select trim engine | **Trim > Engine** |
+| Load ONNX package | **Trim > Load ONNX Package...** |
+| Force a new prediction | **Trim > Force re-run** |
 | Configure the detector | **Trim > Settings...** |
 | Exit | **File > Exit** |
 
@@ -155,9 +167,32 @@ The available settings are:
 
 Accepting new settings reruns the detector for the currently open recording. Canceling the dialog leaves the configuration and current selection unchanged.
 
+## ONNX Pre-annotation
+
+Select **Trim > Load ONNX Package...** and open
+`model_packages/crnn_baseline-1.0.0/model_manifest.json`. The adjacent ONNX file
+is validated by checksum, tensor shape and supported frontend configuration.
+Use **Run Pre-annotation** to obtain a proposal. Automatic execution on opening
+is disabled by default and can be enabled with **Auto-run on open**.
+
+The bundled model sees at most the first **6 seconds** of a recording. Shorter
+audio is padded for inference; longer audio is truncated only in the model's
+input, while the original WAV, playback and manual editing retain their full
+duration. A label indicates truncation. A model result never marks the file as
+reviewed. Existing manual corrections are preserved, and activating a new
+proposal on a reviewed file requires explicit confirmation.
+
+**Force re-run** deliberately creates another prediction. Normal execution
+reuses a prediction with the same audio hash, model and effective configuration.
+Without a valid proposal, a selection can still be confirmed manually.
+
+Engine, manifest path and auto-run preferences are stored per user via QSettings.
+
 ## Annotation Data
 
-Each WAV filename has at most one row in `annotations.db`. Saving the same filename updates its existing row.
+Each WAV filename has at most one current annotation in `annotations.db`.
+Immutable automatic predictions are stored separately and the annotation points
+to its selected proposal.
 
 The stored data includes:
 
@@ -170,6 +205,12 @@ The stored data includes:
 - Review status (`NOT_VIEWED` or `VIEWED`)
 - Whether the manual boundaries differ from the automatic proposal (`is_modified`)
 - Last update timestamp
+- Proposal source and selected prediction ID
+
+The `predictions` table stores the original detector bounds, audio SHA-256,
+effective configuration, model identity, model checksum, preprocessing and
+decoder versions, threshold, and creation time. Re-running a provider does not
+overwrite earlier predictions or manual corrections.
 
 All boundary values other than the millisecond differences are stored in seconds. Annotation persistence is project-local: each selected project directory has its own database.
 
@@ -192,6 +233,12 @@ Rows are ordered by filename and contain:
 - `delta_end_ms`
 - `reviewed` (`true` when the stored status is `VIEWED`)
 - `updated_at`
+- `proposal_source`
+- `prediction_id`
+- `model_id`
+- `model_version`
+- `model_sha256`
+- `threshold`
 
 The four boundary columns and `duration` use seconds. Delta columns use milliseconds. Exporting reads SQLite without modifying annotations or WAV files. If the database contains no annotations, the application reports it without creating an empty export.
 
@@ -216,4 +263,6 @@ smartaudiocrop/
 └── ui/            # Qt windows, dialogs, and audio visualization
 ```
 
-`main.py` remains a compatibility launcher. The primary package entry point is `smartaudiocrop/__main__.py`.
+`main.py` remains a compatibility launcher. The primary package entry point is
+`smartaudiocrop/__main__.py`. A deployable reference model package is available
+under `model_packages/crnn_baseline-1.0.0/`.
