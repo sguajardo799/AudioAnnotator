@@ -2,12 +2,15 @@ import os
 import tempfile
 import unittest
 import wave
+import threading
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -17,11 +20,14 @@ from smartaudiocrop.audio.player import (
     PlaybackSnapshot,
     PlaybackState,
 )
+from smartaudiocrop.settings import ApplicationSettings
+from smartaudiocrop.trim.providers import TrimProposal
 from smartaudiocrop.ui.main_window import (
     COARSE_TRIM_STEP_SECONDS,
     FINE_TRIM_STEP_SECONDS,
     MainWindow,
 )
+from smartaudiocrop.ui.inference_worker import InferenceRequest
 from smartaudiocrop.ui.trim_settings_dialog import TrimSettingsDialog
 
 
@@ -29,6 +35,20 @@ class MainWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = ApplicationSettings(QSettings(
+            str(Path(directory.name) / "preferences.ini"),
+            QSettings.Format.IniFormat,
+        ))
+        settings_patch = patch(
+            "smartaudiocrop.ui.main_window.ApplicationSettings",
+            return_value=settings,
+        )
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
 
     def test_initial_state_has_no_project_and_controls_are_disabled(self):
         window = MainWindow()
@@ -122,7 +142,7 @@ class MainWindowTests(unittest.TestCase):
             self._write_silent_wav(root / "a.wav")
             window = self._open_project(root)
             window.save_annotation()
-            persisted = window.session.annotations.get_all()
+            persisted = window.session.annotations.get_all_for_export()
             window.save_annotation = Mock()
 
             with (
@@ -249,8 +269,8 @@ class MainWindowTests(unittest.TestCase):
             ):
                 window.new_project()
 
-            original_save = window.save_annotation
-            window.save_annotation = Mock(wraps=original_save)
+            original_autosave = window.autosave_annotation
+            window.autosave_annotation = Mock(wraps=original_autosave)
             window.player.stop = Mock()
 
             with patch(
@@ -260,8 +280,8 @@ class MainWindowTests(unittest.TestCase):
             ):
                 window.new_project()
 
-            self.assertEqual(window.save_annotation.call_count, 2)
-            self.assertEqual(window.player.stop.call_count, 2)
+            self.assertEqual(window.autosave_annotation.call_count, 1)
+            self.assertEqual(window.player.stop.call_count, 1)
             self.assertEqual(window.session.current_path.name, "b.wav")
             self.assertEqual(window.session.project_dir, second_project)
 
@@ -390,7 +410,7 @@ class MainWindowTests(unittest.TestCase):
             window.new_project()
         return window
 
-    def test_navigation_updates_review_progress_and_modified_state(self):
+    def test_navigation_saves_draft_without_marking_reviewed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._write_silent_wav(root / "a.wav")
@@ -416,20 +436,20 @@ class MainWindowTests(unittest.TestCase):
             window.next_audio()
 
             first = window.session.annotations.get("a.wav")
-            self.assertEqual(first["status"], "VIEWED")
+            self.assertEqual(first["status"], "NOT_VIEWED")
             self.assertTrue(first["is_modified"])
             self.assertEqual(window.file_counter_label.text(), "File 2 of 2")
             self.assertEqual(window.status_label.text(), "Status: NOT_VIEWED")
-            self.assertEqual(window.progress_bar.value(), 1)
+            self.assertEqual(window.progress_bar.value(), 0)
             self.assertEqual(
                 window.progress_bar.format(),
-                "1/2 reviewed (%p%)",
+                "0/2 reviewed (%p%)",
             )
 
             window.prev_audio()
 
-            self.assertEqual(window.status_label.text(), "Status: VIEWED")
-            self.assertEqual(window.progress_bar.value(), 2)
+            self.assertEqual(window.status_label.text(), "Status: NOT_VIEWED")
+            self.assertEqual(window.progress_bar.value(), 0)
             window.close()
 
     def test_confirm_saves_once_and_advances(self):
@@ -463,6 +483,227 @@ class MainWindowTests(unittest.TestCase):
             window.player.stop.assert_not_called()
             self.assertEqual(window.session.current_index, 0)
             self.assertEqual(window.session.viewed_count, 1)
+            window.close()
+
+    def test_close_without_manual_edit_does_not_create_reviewed_annotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+
+            window.close()
+
+            from smartaudiocrop.annotations.store import AnnotationStore
+
+            store = AnnotationStore(root / "annotations.db")
+            self.assertEqual(store.viewed_filenames(), set())
+            store.close()
+
+    def test_onnx_inference_runs_in_worker_and_only_persists_prediction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav_path = root / "tone.wav"
+            sample_rate = 16_000
+            time = np.arange(sample_rate * 2) / sample_rate
+            samples = np.concatenate(
+                [
+                    np.zeros(sample_rate // 2),
+                    0.3 * np.sin(2 * np.pi * 220 * time[:sample_rate]),
+                    np.zeros(sample_rate // 2),
+                ]
+            )
+            with wave.open(str(wav_path), "wb") as audio_file:
+                audio_file.setnchannels(1)
+                audio_file.setsampwidth(2)
+                audio_file.setframerate(sample_rate)
+                audio_file.writeframes(
+                    (samples * 32767).astype("<i2").tobytes()
+                )
+
+            qt_settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            window = MainWindow(settings=ApplicationSettings(qt_settings))
+            manifest = (
+                Path(__file__).resolve().parents[1]
+                / "model_packages"
+                / "crnn_baseline-1.0.0"
+                / "model_manifest.json"
+            )
+            window.load_onnx_model(manifest)
+            self._wait_until(lambda: not window._worker_busy)
+            with patch(
+                "smartaudiocrop.ui.main_window.QFileDialog.getExistingDirectory",
+                return_value=str(root),
+            ):
+                window.new_project()
+
+            window.run_auto_trim()
+            self._wait_until(lambda: not window._worker_busy)
+
+            self.assertEqual(window.proposal_source, "onnx_crnn")
+            self.assertEqual(window.session.annotations.prediction_count(), 1)
+            self.assertIsNone(window.session.get_current_annotation())
+            window.run_auto_trim()
+            self.assertFalse(window._worker_busy)
+            self.assertEqual(window.session.annotations.prediction_count(), 1)
+            window.run_auto_trim(force=True)
+            self._wait_until(lambda: not window._worker_busy)
+            self.assertEqual(window.session.annotations.prediction_count(), 2)
+            self.assertAlmostEqual(window.auto_start, 0.47, places=2)
+            self.assertAlmostEqual(window.auto_end, 1.525, places=2)
+            window.audio_view.set_manual_bounds(0.48, 1.50)
+            window.on_region_changed()
+            window.save_annotation()
+            saved = window.session.get_current_annotation()
+            self.assertEqual(saved["status"], "VIEWED")
+            self.assertEqual(saved["proposal_source"], "onnx_crnn")
+            window.close()
+
+            reopened_settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            reopened = MainWindow(
+                settings=ApplicationSettings(reopened_settings)
+            )
+            self._wait_until(lambda: not reopened._worker_busy)
+            with patch(
+                "smartaudiocrop.ui.main_window.QFileDialog.getExistingDirectory",
+                return_value=str(root),
+            ):
+                reopened.new_project()
+            self.assertEqual(reopened.audio_view.manual_bounds(), (0.48, 1.5))
+            self.assertEqual(reopened.proposal_source, "onnx_crnn")
+            self.assertEqual(reopened.session.viewed_count, 1)
+            reopened.close()
+
+    def test_failed_heuristic_rerun_preserves_existing_manual_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            window = self._open_project(root)
+            window.audio_view.set_manual_bounds(0.02, 0.2)
+            window.save_annotation()
+
+            with patch(
+                "smartaudiocrop.ui.main_window.QMessageBox.warning"
+            ) as warning:
+                window.run_auto_trim(force=True)
+
+            self.assertEqual(window.audio_view.manual_bounds(), (0.02, 0.2))
+            warning.assert_called_once()
+            window.close()
+
+    def test_stale_inference_result_does_not_touch_new_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            self._write_silent_wav(root / "b.wav")
+            window = self._open_project(root)
+            request = InferenceRequest(
+                request_id=window._request_id,
+                project_generation=window.session.project_generation,
+                project_id=str(root.resolve()),
+                audio_generation=window._audio_generation,
+                audio_id="a.wav",
+                model_revision=window._loaded_model_revision,
+                audio_path=root / "a.wav",
+                audio_sha256=window.audio_sha256,
+                audio=window.audio.copy(),
+                sample_rate=window.sr,
+            )
+            proposal = TrimProposal(
+                start=0.01,
+                end=0.2,
+                source="onnx_crnn",
+                audio_sha256=window.audio_sha256,
+                config={"threshold": 0.5},
+            )
+
+            window.next_audio()
+            window.on_inference_succeeded(request, proposal)
+
+            self.assertEqual(window.session.current_path.name, "b.wav")
+            self.assertEqual(window.session.annotations.prediction_count(), 0)
+            window.close()
+
+    def test_close_while_worker_is_busy_is_deferred_without_blocking(self):
+        window = MainWindow()
+        window._worker_busy = True
+
+        window.close()
+
+        self.assertTrue(window._deferred_close)
+        self._wait_until(lambda: window._shutdown_complete)
+        self.assertFalse(window.inference_thread.isRunning())
+
+    def test_real_worker_keeps_navigation_responsive_and_closes_safely(self):
+        started = threading.Event()
+        release = threading.Event()
+        worker_threads = []
+
+        class FakeProvider:
+            def __init__(self, path):
+                from smartaudiocrop.trim.model_package import ModelManifest
+                self.manifest = ModelManifest.load(path)
+
+            def infer(self, audio, sample_rate, path, audio_hash):
+                worker_threads.append(threading.get_ident())
+                started.set()
+                release.wait(5)
+                return TrimProposal(
+                    start=0.01, end=0.2, source="onnx_crnn",
+                    audio_sha256=audio_hash, config=self.manifest.config,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            self._write_silent_wav(root / "b.wav")
+            manifest = Path(__file__).resolve().parents[1] / (
+                "model_packages/crnn_baseline-1.0.0/model_manifest.json"
+            )
+            with patch(
+                "smartaudiocrop.ui.inference_worker.OnnxTrimProvider", FakeProvider
+            ):
+                window = self._open_project(root)
+                try:
+                    window.load_onnx_model(manifest)
+                    self._wait_until(lambda: not window._worker_busy)
+                    window.run_auto_trim()
+                    self._wait_until(started.is_set)
+                    window.update_playback_ui()
+                    self.assertFalse(window.run_trim_action.isEnabled())
+                    self.assertTrue(window.play_button.isEnabled())
+                    window.next_audio()
+                    self.assertEqual(window.session.current_path.name, "b.wav")
+                    window.close()
+                    self.assertTrue(window._deferred_close)
+                    self.assertNotEqual(worker_threads[0], threading.get_ident())
+                finally:
+                    release.set()
+                    self._wait_until(lambda: not window.inference_thread.isRunning())
+                    self.app.processEvents()
+                    window.close()
+
+    def test_failed_autosave_keeps_dirty_edits_and_current_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_silent_wav(root / "a.wav")
+            self._write_silent_wav(root / "b.wav")
+            window = self._open_project(root)
+            window.audio_view.set_manual_bounds(0.02, 0.2)
+            window.on_region_changed()
+            with patch.object(
+                window.session, "autosave_current_annotation",
+                side_effect=RuntimeError("database failure"),
+            ), patch("smartaudiocrop.ui.main_window.QMessageBox.warning"):
+                window.next_audio()
+            self.assertEqual(window.session.current_path.name, "a.wav")
+            self.assertTrue(window.manual_dirty)
+            self.assertEqual(window.session.viewed_count, 0)
             window.close()
 
     def test_shortcuts_use_window_context_and_safe_auto_repeat(self):
@@ -601,6 +842,16 @@ class MainWindowTests(unittest.TestCase):
             audio_file.setsampwidth(2)
             audio_file.setframerate(8_000)
             audio_file.writeframes(b"\x00\x00" * 2_048)
+
+    @classmethod
+    def _wait_until(cls, predicate, timeout_ms=5_000):
+        elapsed = 0
+        while not predicate() and elapsed < timeout_ms:
+            QTest.qWait(20)
+            elapsed += 20
+        cls.app.processEvents()
+        if not predicate():
+            raise AssertionError("Timed out waiting for Qt worker")
 
 
 if __name__ == "__main__":

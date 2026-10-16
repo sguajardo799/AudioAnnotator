@@ -3,6 +3,8 @@ from scipy.signal import stft
 
 
 def spectrogram(audio, sr, n_fft=1024, hop_size=256):
+    n_fft = min(n_fft, len(audio))
+    hop_size = min(hop_size, n_fft)
     frequencies, times, Zxx = stft(
         audio,
         fs=sr,

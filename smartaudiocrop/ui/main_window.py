@@ -1,10 +1,12 @@
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QKeySequence,
     QShortcut,
 )
@@ -26,12 +28,24 @@ from smartaudiocrop.annotations.exporter import (
     AnnotationExportError,
     AnnotationExporter,
 )
-from smartaudiocrop.audio.loading import load_audio
+from smartaudiocrop.audio.loading import load_audio_snapshot
 from smartaudiocrop.audio.player import AudioPlayer, PlaybackState
 from smartaudiocrop.project.session import ProjectSession
+from smartaudiocrop.settings import ApplicationSettings, TrimPreferences
 from smartaudiocrop.trim.config import TrimConfig
-from smartaudiocrop.trim.detector import estimate_trim
+from smartaudiocrop.trim.providers import (
+    HeuristicTrimProvider,
+    NoActivityDetected,
+    TrimProposal,
+    TrimProviderError,
+    file_sha256,
+)
 from smartaudiocrop.ui.audio_view import AudioView
+from smartaudiocrop.ui.inference_worker import (
+    InferenceRequest,
+    InferenceWorker,
+    ModelLoadRequest,
+)
 from smartaudiocrop.ui.trim_settings_dialog import TrimSettingsDialog
 
 
@@ -40,7 +54,14 @@ COARSE_TRIM_STEP_SECONDS = 0.025
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, player: AudioPlayer | None = None):
+    load_model_requested = Signal(object)
+    inference_requested = Signal(object)
+
+    def __init__(
+        self,
+        player: AudioPlayer | None = None,
+        settings: ApplicationSettings | None = None,
+    ):
         super().__init__()
 
         self.setWindowTitle("Audio Annotator")
@@ -52,6 +73,11 @@ class MainWindow(QMainWindow):
 
         self.player = player or AudioPlayer()
         self.session = ProjectSession()
+        self.settings = settings or ApplicationSettings()
+        preferences = self.settings.trim_preferences()
+        self.selected_engine = preferences.engine
+        self.model_manifest_path = preferences.manifest_path
+        self.auto_run_on_open = preferences.auto_run_on_open
 
         # Configuración actual del detector.
         self.trim_config = TrimConfig()
@@ -67,10 +93,27 @@ class MainWindow(QMainWindow):
 
         self.sr = 0
         self.duration = 0.0
+        self.audio_sha256 = ""
 
         # Propuesta automática del detector.
         self.auto_start: float | None = None
         self.auto_end: float | None = None
+        self.active_prediction_id: int | None = None
+        self.proposal_source: str | None = None
+        self.active_proposal: TrimProposal | None = None
+        self.manual_dirty = False
+        self._setting_bounds = False
+
+        self._request_id = 0
+        self._audio_generation = 0
+        self._model_revision = 0
+        self._loaded_model_revision = 0
+        self._loaded_manifest = None
+        self._worker_busy = False
+        self._pending_auto_run = False
+        self._closing = False
+        self._deferred_close = False
+        self._shutdown_complete = False
 
         # =====================================================
         # Construcción de interfaz
@@ -79,6 +122,7 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.setup_menus()
         self.setup_shortcuts()
+        self.setup_inference_worker()
 
         self.playback_timer = QTimer(self)
         self.playback_timer.setInterval(33)
@@ -90,6 +134,27 @@ class MainWindow(QMainWindow):
         self.clear_project_view()
 
         self.update_playback_ui()
+
+        if self.selected_engine == "onnx_crnn" and self.model_manifest_path:
+            self.load_onnx_model(Path(self.model_manifest_path))
+
+    def setup_inference_worker(self):
+        self.inference_thread = QThread(self)
+        self.inference_worker = InferenceWorker()
+        self.inference_worker.moveToThread(self.inference_thread)
+        self.load_model_requested.connect(self.inference_worker.load_model)
+        self.inference_requested.connect(self.inference_worker.infer)
+        self.inference_worker.model_loaded.connect(self.on_model_loaded)
+        self.inference_worker.inference_succeeded.connect(
+            self.on_inference_succeeded
+        )
+        self.inference_worker.failed.connect(self.on_inference_failed)
+        self.inference_worker.idle.connect(self.on_worker_idle)
+        self.inference_thread.finished.connect(
+            self.inference_worker.deleteLater
+        )
+        self.inference_thread.finished.connect(self._finish_deferred_close)
+        self.inference_thread.start()
 
     # =========================================================
     # UI
@@ -176,6 +241,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel(
             "Status: -"
         )
+        self.engine_status_label = QLabel("Engine: Heuristic")
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(True)
 
@@ -185,6 +251,7 @@ class MainWindow(QMainWindow):
         tracking.addWidget(
             self.status_label
         )
+        tracking.addWidget(self.engine_status_label)
         tracking.addStretch()
         tracking.addWidget(
             self.progress_bar,
@@ -304,6 +371,40 @@ class MainWindow(QMainWindow):
 
         trim_menu = menu_bar.addMenu("Trim")
 
+        engine_menu = trim_menu.addMenu("Engine")
+        self.engine_group = QActionGroup(self)
+        self.engine_group.setExclusive(True)
+        self.heuristic_engine_action = QAction("Heuristic", self)
+        self.heuristic_engine_action.setCheckable(True)
+        self.heuristic_engine_action.triggered.connect(
+            self.select_heuristic_engine
+        )
+        self.onnx_engine_action = QAction("ONNX Model", self)
+        self.onnx_engine_action.setCheckable(True)
+        self.onnx_engine_action.triggered.connect(self.select_onnx_engine)
+        self.engine_group.addAction(self.heuristic_engine_action)
+        self.engine_group.addAction(self.onnx_engine_action)
+        engine_menu.addAction(self.heuristic_engine_action)
+        engine_menu.addAction(self.onnx_engine_action)
+        self.heuristic_engine_action.setChecked(
+            self.selected_engine == "heuristic"
+        )
+        self.onnx_engine_action.setChecked(
+            self.selected_engine == "onnx_crnn"
+        )
+
+        self.load_model_action = QAction("Load ONNX Package...", self)
+        self.load_model_action.triggered.connect(self.choose_onnx_model)
+        trim_menu.addAction(self.load_model_action)
+
+        self.auto_run_action = QAction("Auto-run on open", self)
+        self.auto_run_action.setCheckable(True)
+        self.auto_run_action.setChecked(self.auto_run_on_open)
+        self.auto_run_action.toggled.connect(self.set_auto_run_on_open)
+        trim_menu.addAction(self.auto_run_action)
+
+        trim_menu.addSeparator()
+
         self.run_trim_action = QAction(
             "Run detector",
             self,
@@ -316,6 +417,12 @@ class MainWindow(QMainWindow):
         trim_menu.addAction(
             self.run_trim_action
         )
+
+        self.force_run_action = QAction("Force re-run", self)
+        self.force_run_action.triggered.connect(
+            lambda: self.run_auto_trim(force=True)
+        )
+        trim_menu.addAction(self.force_run_action)
 
         self.reset_trim_action = QAction(
             "Reset manual selection",
@@ -457,7 +564,7 @@ class MainWindow(QMainWindow):
         if store is None or self.session.project_dir is None:
             return
 
-        annotations = store.get_all()
+        annotations = store.get_all_for_export()
 
         if not annotations:
             QMessageBox.warning(
@@ -570,7 +677,8 @@ class MainWindow(QMainWindow):
         # -----------------------------------------------------
 
         if self.session.files:
-            self.save_annotation()
+            if not self.autosave_annotation():
+                return
 
         # Detener cualquier reproducción activa.
         self.player.stop()
@@ -579,21 +687,13 @@ class MainWindow(QMainWindow):
         # Inicializar proyecto
         # -----------------------------------------------------
 
-        self.session.project_dir = (
-            project_dir
-        )
-
-        # Guardar proyecto anterior.
-        if self.session.files:
-            self.save_annotation()
-
-        # Cerrar DB anterior.
-        self.session.close_annotations()
-
-        self.player.stop()
-
         # Nuevo proyecto.
-        self.session.replace(project_dir, files)
+        try:
+            self.session.replace(project_dir, files)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could Not Open Project", str(exc))
+            return
+        self._request_id += 1
 
         # Limpiar información del audio anterior antes
         # de cargar el nuevo proyecto.
@@ -604,9 +704,14 @@ class MainWindow(QMainWindow):
 
         self.sr = 0
         self.duration = 0.0
+        self.audio_sha256 = ""
 
         self.auto_start = None
         self.auto_end = None
+        self.active_prediction_id = None
+        self.proposal_source = None
+        self.active_proposal = None
+        self.manual_dirty = False
 
         # -----------------------------------------------------
         # Cargar primer audio
@@ -644,7 +749,18 @@ class MainWindow(QMainWindow):
         actual del proyecto y el índice del archivo.
         """
 
-        has_audio = bool(self.session.files)
+        has_audio = bool(self.session.files) and self.duration > 0
+        engine_text = "Engine: Heuristic"
+        if self.selected_engine == "onnx_crnn":
+            engine_text = "Engine: ONNX"
+            if self._loaded_manifest is not None:
+                engine_text += (
+                    f" · {self._loaded_manifest.model_id} "
+                    f"{self._loaded_manifest.model_version}"
+                )
+        if self._worker_busy:
+            engine_text += " · Working..."
+        self.engine_status_label.setText(engine_text)
         has_previous = self.session.has_previous
         has_next = self.session.has_next
 
@@ -684,6 +800,16 @@ class MainWindow(QMainWindow):
 
         self.run_trim_action.setEnabled(
             has_audio
+            and not self._worker_busy
+            and (
+                self.selected_engine == "heuristic"
+                or self._loaded_manifest is not None
+            )
+        )
+        self.force_run_action.setEnabled(self.run_trim_action.isEnabled())
+        self.load_model_action.setEnabled(not self._worker_busy)
+        self.trim_settings_action.setEnabled(
+            self.selected_engine == "heuristic" and not self._worker_busy
         )
 
         self.reset_trim_action.setEnabled(
@@ -738,8 +864,30 @@ class MainWindow(QMainWindow):
             return
 
         path = self.session.current_path
-
-        self.audio, self.sr = load_audio(path)
+        self._audio_generation += 1
+        self._request_id += 1
+        self.manual_dirty = False
+        self._pending_auto_run = False
+        try:
+            self.audio, self.sr, self.audio_sha256 = load_audio_snapshot(path)
+            if (
+                self.sr <= 0 or len(self.audio) == 0
+                or self.audio.ndim not in (1, 2)
+                or not np.all(np.isfinite(self.audio))
+            ):
+                raise ValueError("WAV is empty or contains invalid samples")
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.audio = np.array([], dtype=np.float32)
+            self.sr = 0
+            self.duration = 0.0
+            self.auto_start = self.auto_end = None
+            self.active_prediction_id = None
+            self.proposal_source = None
+            self.active_proposal = None
+            self.audio_view.clear()
+            self.update_controls()
+            QMessageBox.warning(self, "Could Not Load WAV", str(exc))
+            return
 
         self.player.set_source(
             self.audio,
@@ -756,13 +904,28 @@ class MainWindow(QMainWindow):
             self.sr,
             self.duration,
         )
+        self._setting_bounds = True
+        self.audio_view.set_manual_bounds(0.0, self.duration)
+        self._setting_bounds = False
+        self.auto_start = None
+        self.auto_end = None
+        self.active_prediction_id = None
+        self.proposal_source = None
+        self.active_proposal = None
+        self.manual_dirty = False
 
-        # Primero calculamos el trim automático actual.
-        self.run_auto_trim()
-
-        # Si el archivo ya fue editado anteriormente,
-        # restauramos su anotación manual.
-        self.restore_annotation()
+        annotation = self.restore_annotation()
+        if annotation is None:
+            if self.selected_engine == "heuristic":
+                self.run_auto_trim()
+            elif self.auto_run_on_open and self._loaded_manifest is not None:
+                if self._worker_busy:
+                    self._pending_auto_run = True
+                else:
+                    self.run_auto_trim()
+            else:
+                self.audio_view.clear_proposal()
+                self.audio_view.set_proposal_text("No active proposal")
 
         self.setWindowTitle(
             (
@@ -779,39 +942,340 @@ class MainWindow(QMainWindow):
     # Detector automático
     # =========================================================
 
-    def run_auto_trim(self):
-        if not self.session.files:
+    def run_auto_trim(self, force: bool = False):
+        if not self.session.files or self.duration <= 0:
             return
 
-        result = estimate_trim(
-            self.audio,
-            self.sr,
-            self.trim_config,
-        )
+        if self.selected_engine == "onnx_crnn":
+            self.run_onnx_inference(force=force)
+            return
 
-        if result is None:
+        try:
+            proposal = HeuristicTrimProvider(self.trim_config).infer(
+                self.audio,
+                self.sr,
+                self.session.current_path,
+                self.audio_sha256,
+            )
+        except NoActivityDetected as exc:
+            if self.session.get_current_annotation() is not None or self.manual_dirty:
+                QMessageBox.warning(self, "Trim Failed", str(exc))
+                return
             self.auto_start = 0.0
-            self.auto_end = (
-                self.duration
-            )
+            self.auto_end = self.duration
+            self.active_prediction_id = None
+            self.proposal_source = None
+            self.active_proposal = None
+            self._setting_bounds = True
+            self.audio_view.set_manual_bounds(self.auto_start, self.auto_end)
+            self.audio_view.sync_selection_markers()
+            self._setting_bounds = False
+            self.audio_view.clear_proposal()
+            self.audio_view.set_proposal_text("Manual selection")
+            return
+        except (OSError, ValueError, TrimProviderError) as exc:
+            QMessageBox.warning(self, "Trim Failed", str(exc))
+            return
+        self.apply_proposal(proposal, force=force)
 
-        else:
-            self.auto_start = (
-                result.start
+    def apply_proposal(self, proposal: TrimProposal, *, force: bool = False):
+        store = self.session.annotations
+        if store is None:
+            return
+        if proposal.audio_sha256 != self.audio_sha256:
+            QMessageBox.warning(
+                self,
+                "Audio Changed",
+                "The proposal does not match the loaded WAV and was discarded.",
             )
+            return
+        try:
+            reusable = None
+            if not force:
+                reusable = store.find_reusable_prediction(
+                    filename=self.session.current_path.name,
+                    audio_sha256=proposal.audio_sha256,
+                    source=proposal.source,
+                    config=proposal.config,
+                    model_sha256=proposal.model_sha256,
+                )
+            if reusable is None:
+                prediction_id = store.insert_prediction(
+                    filename=self.session.current_path.name,
+                    audio_sha256=proposal.audio_sha256,
+                    source=proposal.source,
+                    config=proposal.config,
+                    predicted_start=proposal.start,
+                    predicted_end=proposal.end,
+                    model_id=proposal.model_id,
+                    model_version=proposal.model_version,
+                    model_sha256=proposal.model_sha256,
+                    preprocessing_version=proposal.preprocessing_version,
+                    decoder_version=proposal.decoder_version,
+                    threshold=proposal.threshold,
+                    bridge_ms=proposal.bridge_ms,
+                )
+            else:
+                prediction_id = int(reusable["id"])
+                proposal = replace(
+                    proposal,
+                    start=float(reusable["predicted_start"]),
+                    end=float(reusable["predicted_end"]),
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "Could Not Save Prediction", str(exc))
+            return
 
-            self.auto_end = (
-                result.end
+        annotation = self.session.get_current_annotation()
+        if annotation is not None and annotation["status"] == "VIEWED":
+            answer = QMessageBox.question(
+                self,
+                "Activate New Proposal",
+                (
+                    "A reviewed annotation already exists. Activate the new "
+                    "proposal while preserving its manual bounds?"
+                ),
             )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.audio_view.set_proposal_text(
+                    self._proposal_text_for_annotation(annotation)
+                )
+                return
 
-        # Inicializar la selección manual a partir
-        # de la propuesta.
-        self.audio_view.set_auto_bounds(
-            self.auto_start,
-            self.auto_end,
+        if annotation is not None:
+            try:
+                store.select_prediction(
+                    filename=self.session.current_path.name,
+                    prediction_id=prediction_id,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Could Not Select Prediction", str(exc))
+                return
+
+        self.auto_start = proposal.start
+        self.auto_end = proposal.end
+        self.active_prediction_id = prediction_id
+        self.proposal_source = proposal.source
+        self.active_proposal = proposal
+        self.audio_view.set_proposal_bounds(proposal.start, proposal.end)
+        source_text = "Heuristic"
+        if proposal.source == "onnx_crnn":
+            source_text = f"ONNX · {proposal.model_id} {proposal.model_version}"
+        if proposal.truncated:
+            source_text += " · input truncated to 6.0 s"
+        self.audio_view.set_proposal_text(f"Proposal: {source_text}")
+
+        if annotation is None and not self.manual_dirty:
+            self._setting_bounds = True
+            self.audio_view.set_manual_bounds(proposal.start, proposal.end)
+            self.audio_view.sync_selection_markers()
+            self._setting_bounds = False
+
+    def run_onnx_inference(self, *, force: bool = False):
+        if self._worker_busy or self._loaded_manifest is None:
+            return
+        if not force:
+            try:
+                prediction = self.session.annotations.find_reusable_prediction(
+                    filename=self.session.current_path.name,
+                    audio_sha256=self.audio_sha256,
+                    source="onnx_crnn",
+                    config=self._loaded_manifest.config,
+                    model_sha256=self._loaded_manifest.model_sha256,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Could Not Read Predictions", str(exc))
+                return
+            if prediction is not None:
+                self.apply_proposal(
+                    TrimProposal(
+                        start=prediction["predicted_start"],
+                        end=prediction["predicted_end"],
+                        source="onnx_crnn",
+                        audio_sha256=prediction["audio_sha256"],
+                        config=self._loaded_manifest.config,
+                        model_id=prediction["model_id"],
+                        model_version=prediction["model_version"],
+                        model_sha256=prediction["model_sha256"],
+                        preprocessing_version=prediction["preprocessing_version"],
+                        decoder_version=prediction["decoder_version"],
+                        threshold=prediction["threshold"],
+                        bridge_ms=prediction["bridge_ms"],
+                        truncated=self.duration > self._loaded_manifest.max_duration_seconds,
+                    )
+                )
+                return
+        self._request_id += 1
+        request = InferenceRequest(
+            request_id=self._request_id,
+            project_generation=self.session.project_generation,
+            project_id=str(self.session.project_dir.resolve()),
+            audio_generation=self._audio_generation,
+            audio_id=self.session.current_path.name,
+            model_revision=self._loaded_model_revision,
+            audio_path=self.session.current_path,
+            audio_sha256=self.audio_sha256,
+            audio=np.ascontiguousarray(self.audio.copy()),
+            sample_rate=self.sr,
+            force=force,
+        )
+        request.audio.setflags(write=False)
+        self._worker_busy = True
+        self.audio_view.set_proposal_text("Inferring...")
+        self.update_controls()
+        self.inference_requested.emit(request)
+
+    def _request_is_current(self, request: InferenceRequest) -> bool:
+        return (
+            not self._closing
+            and bool(self.session.files)
+            and request.request_id == self._request_id
+            and request.project_generation == self.session.project_generation
+            and request.project_id == str(self.session.project_dir.resolve())
+            and request.audio_generation == self._audio_generation
+            and request.audio_id == self.session.current_path.name
+            and request.model_revision == self._loaded_model_revision
         )
 
-        self.on_region_changed()
+    def on_inference_succeeded(
+        self,
+        request: InferenceRequest,
+        proposal: TrimProposal,
+    ):
+        if not self._request_is_current(request):
+            return
+        try:
+            current_sha256 = file_sha256(self.session.current_path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Audio Changed", str(exc))
+            return
+        if current_sha256 != request.audio_sha256:
+            QMessageBox.warning(
+                self,
+                "Audio Changed",
+                "The WAV changed during inference; its result was discarded.",
+            )
+            return
+        self.apply_proposal(proposal, force=request.force)
+
+    def on_inference_failed(self, request, message: str):
+        if isinstance(request, ModelLoadRequest):
+            if request.revision != self._model_revision or self._closing:
+                return
+            self._loaded_manifest = None
+            self._loaded_model_revision = 0
+            self.selected_engine = "heuristic"
+            self.heuristic_engine_action.setChecked(True)
+            self.run_trim_action.setText("Run detector")
+            self._save_preferences()
+            QMessageBox.warning(self, "ONNX Model Error", message)
+            return
+        if isinstance(request, InferenceRequest) and self._request_is_current(request):
+            annotation = self.session.get_current_annotation()
+            if annotation is not None:
+                self.audio_view.set_proposal_text(
+                    self._proposal_text_for_annotation(annotation)
+                )
+            else:
+                self.audio_view.set_proposal_text("No active proposal")
+            QMessageBox.warning(self, "ONNX Inference Failed", message)
+
+    def on_worker_idle(self):
+        self._worker_busy = False
+        if self._closing:
+            return
+        self.update_controls()
+        if (
+            self._pending_auto_run
+            and not self._closing
+            and self.session.files
+            and self.session.get_current_annotation() is None
+        ):
+            self._pending_auto_run = False
+            QTimer.singleShot(0, self.run_auto_trim)
+
+    def choose_onnx_model(self):
+        manifest_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select ONNX Model Manifest",
+            self.model_manifest_path,
+            "Model Manifest (model_manifest.json);;JSON Files (*.json)",
+        )
+        if manifest_path:
+            self.load_onnx_model(Path(manifest_path))
+
+    def load_onnx_model(self, manifest_path: Path):
+        if self._worker_busy:
+            return
+        self._model_revision += 1
+        self._worker_busy = True
+        self.update_controls()
+        self.load_model_requested.emit(
+            ModelLoadRequest(self._model_revision, manifest_path.resolve())
+        )
+
+    def on_model_loaded(self, request: ModelLoadRequest, manifest):
+        if request.revision != self._model_revision or self._closing:
+            return
+        self._loaded_manifest = manifest
+        self._loaded_model_revision = request.revision
+        self.model_manifest_path = str(request.manifest_path)
+        self.selected_engine = "onnx_crnn"
+        self.onnx_engine_action.setChecked(True)
+        self.run_trim_action.setText("Run Pre-annotation")
+        self._save_preferences()
+        if (
+            self.session.files
+            and self.auto_run_on_open
+            and self.session.get_current_annotation() is None
+        ):
+            QTimer.singleShot(0, self.run_auto_trim)
+
+    def select_heuristic_engine(self):
+        self._pending_auto_run = False
+        self.selected_engine = "heuristic"
+        self.run_trim_action.setText("Run detector")
+        self._request_id += 1
+        self._save_preferences()
+        self.update_controls()
+
+    def select_onnx_engine(self):
+        if self._loaded_manifest is None:
+            self.onnx_engine_action.setChecked(False)
+            self.heuristic_engine_action.setChecked(True)
+            if self.model_manifest_path:
+                self.load_onnx_model(Path(self.model_manifest_path))
+            else:
+                self.choose_onnx_model()
+            return
+        self.selected_engine = "onnx_crnn"
+        self.run_trim_action.setText("Run Pre-annotation")
+        self._save_preferences()
+        self.update_controls()
+
+    def set_auto_run_on_open(self, enabled: bool):
+        self.auto_run_on_open = enabled
+        self._save_preferences()
+
+    def _save_preferences(self):
+        self.settings.save_trim_preferences(
+            TrimPreferences(
+                engine=self.selected_engine,
+                manifest_path=self.model_manifest_path,
+                auto_run_on_open=self.auto_run_on_open,
+            )
+        )
+
+    @staticmethod
+    def _proposal_text_for_annotation(annotation: dict) -> str:
+        source = annotation.get("proposal_source")
+        if source == "heuristic":
+            return "Proposal: Heuristic"
+        if source == "onnx_crnn":
+            return "Proposal: ONNX"
+        if source == "legacy":
+            return "Proposal: Legacy"
+        return "Manual selection"
 
     # =========================================================
     # Reset manual
@@ -831,6 +1295,8 @@ class MainWindow(QMainWindow):
             self.auto_start,
             self.auto_end,
         )
+        self.audio_view.sync_selection_markers()
+        self.manual_dirty = True
 
     # =========================================================
     # Región
@@ -841,6 +1307,8 @@ class MainWindow(QMainWindow):
             return
 
         self.audio_view.sync_selection_markers()
+        if not self._setting_bounds:
+            self.manual_dirty = True
 
     # =========================================================
     # Playback
@@ -935,60 +1403,92 @@ class MainWindow(QMainWindow):
     # =========================================================
 
     def save_annotation(self):
-        """
-        Guarda la anotación del archivo actual.
-
-        No hace nada si no existe un proyecto activo.
-        """
-
-        if not self.session.files:
-            return
-
-        if (
-            self.auto_start is None
-            or self.auto_end is None
-        ):
-            return
-
-        manual_start, manual_end = self.audio_view.manual_bounds()
-
-        self.session.save_annotation(
-            duration=self.duration,
-            sample_rate=self.sr,
-            auto_start=self.auto_start,
-            auto_end=self.auto_end,
-            manual_start=manual_start,
-            manual_end=manual_end,
-        )
+        """Explicitly confirm the current manual selection as reviewed."""
+        if not self.session.files or self.duration <= 0:
+            return False
+        values = self._annotation_values()
+        try:
+            self.session.confirm_current_annotation(**values)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could Not Save Annotation", str(exc))
+            return False
+        self.manual_dirty = False
         self.update_project_tracking_ui()
+        return True
+
+    def autosave_annotation(self):
+        """Save human edits without changing review status."""
+        if not self.session.files or not self.manual_dirty:
+            return True
+        values = self._annotation_values()
+        try:
+            self.session.autosave_current_annotation(**values)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could Not Save Draft", str(exc))
+            return False
+        self.manual_dirty = False
+        self.update_project_tracking_ui()
+        return True
+
+    def _annotation_values(self) -> dict:
+        manual_start, manual_end = self.audio_view.manual_bounds()
+        auto_start = self.auto_start
+        auto_end = self.auto_end
+        if auto_start is None or auto_end is None:
+            auto_start, auto_end = manual_start, manual_end
+        return {
+            "duration": self.duration,
+            "sample_rate": self.sr,
+            "auto_start": auto_start,
+            "auto_end": auto_end,
+            "manual_start": manual_start,
+            "manual_end": manual_end,
+            "proposal_source": self.proposal_source,
+            "prediction_id": self.active_prediction_id,
+        }
 
     def restore_annotation(self):
         """
-        Si el archivo actual posee una anotación guardada,
-        restaura la selección manual.
-
-        La propuesta automática actual permanece intacta.
+        Restore both the persisted proposal and the editable selection.
         """
 
         annotation = self.session.get_current_annotation()
 
         if annotation is None:
-            return
+            return None
 
-        manual_start = annotation[
-            "manual_start"
-        ]
-
-        manual_end = annotation[
-            "manual_end"
-        ]
-
+        self.auto_start = float(annotation["auto_start"])
+        self.auto_end = float(annotation["auto_end"])
+        self.active_prediction_id = annotation["prediction_id"]
+        self.proposal_source = annotation["proposal_source"]
+        self.audio_view.set_proposal_bounds(self.auto_start, self.auto_end)
+        label = "Manual selection"
+        if self.proposal_source == "heuristic":
+            label = "Proposal: Heuristic"
+        elif self.proposal_source == "onnx_crnn":
+            prediction = None
+            if self.active_prediction_id is not None:
+                prediction = self.session.annotations.get_prediction(
+                    int(self.active_prediction_id)
+                )
+            identity = "ONNX"
+            if prediction is not None:
+                identity += (
+                    f" · {prediction['model_id']} {prediction['model_version']}"
+                )
+            label = f"Proposal: {identity}"
+        elif self.proposal_source == "legacy":
+            label = "Proposal: Legacy"
+        self.audio_view.set_proposal_text(label)
+        self._setting_bounds = True
         self.audio_view.set_manual_bounds(
-            manual_start,
-            manual_end,
+            float(annotation["manual_start"]),
+            float(annotation["manual_end"]),
         )
-
-        self.on_region_changed()
+        self.audio_view.sync_selection_markers()
+        self._setting_bounds = False
+        self.manual_dirty = False
+        return annotation
 
     def closeEvent(self, event):
         """
@@ -996,15 +1496,42 @@ class MainWindow(QMainWindow):
         antes de terminar la aplicación.
         """
 
+        if self._shutdown_complete:
+            event.accept()
+            return
+        if self._closing:
+            event.ignore()
+            return
         if self.session.files:
-            self.save_annotation()
+            if not self.autosave_annotation():
+                event.ignore()
+                return
+        self._closing = True
+        self._request_id += 1
 
         self.playback_timer.stop()
         self.player.close()
-
+        self.inference_thread.requestInterruption()
+        self.inference_thread.quit()
+        if self._worker_busy and self.inference_thread.isRunning():
+            self._deferred_close = True
+            event.ignore()
+            return
+        self.inference_thread.wait(2_000)
+        if self.inference_thread.isRunning():
+            self._deferred_close = True
+            event.ignore()
+            return
         self.session.close_annotations()
-
+        self._shutdown_complete = True
         event.accept()
+
+    def _finish_deferred_close(self):
+        if not self._deferred_close or self._shutdown_complete:
+            return
+        self.session.close_annotations()
+        self._shutdown_complete = True
+        QTimer.singleShot(0, self.close)
 
     # =========================================================
     # Navegación
@@ -1014,7 +1541,8 @@ class MainWindow(QMainWindow):
         if not self.session.files:
             return
 
-        self.save_annotation()
+        if not self.save_annotation():
+            return
 
         if self.session.has_next:
             self._change_audio(+1)
@@ -1038,8 +1566,9 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        # Guardar antes de abandonar el WAV.
-        self.save_annotation()
+        # Autosave preserves drafts but never confirms review.
+        if not self.autosave_annotation():
+            return
 
         self._change_audio(offset)
 
